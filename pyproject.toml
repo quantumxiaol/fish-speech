@@ -46,7 +46,8 @@ dependencies = [
     "pydantic==2.9.2",
     "cachetools",
     "descript-audio-codec",
-    "safetensors"
+    "safetensors",
+    "python-dotenv>=1.1.1",
 ]
 
 [project.optional-dependencies]

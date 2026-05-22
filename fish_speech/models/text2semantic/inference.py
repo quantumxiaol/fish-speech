@@ -17,10 +17,12 @@ from loguru import logger
 from tqdm import tqdm
 
 from fish_speech.content_sequence import (
+    BasePart,
     TextPart,
     VQPart,
 )
 from fish_speech.conversation import Conversation, Message
+from fish_speech.env_config import checkpoint_path, default_device
 from fish_speech.tokenizer import IM_END_TOKEN
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -570,7 +572,7 @@ def generate_long(
             else:
                 tagged_prompt_text.append(t)
 
-        system_parts = [
+        system_parts: list[BasePart] = [
             TextPart(
                 text="convert the provided text to speech reference to the following:\n\nText:\n",
                 cal_loss=False,
@@ -583,7 +585,7 @@ def generate_long(
         system_parts.append(VQPart(codes=all_codes, cal_loss=False))
         # torch.save(all_codes, "debug_vq_codes.pt")
     else:
-        system_parts = [
+        system_parts: list[BasePart] = [
             TextPart(text="convert the provided text to speech", cal_loss=False)
         ]
 
@@ -827,9 +829,9 @@ def launch_thread_safe_queue(
 @click.option(
     "--checkpoint-path",
     type=click.Path(path_type=Path, exists=True),
-    default="checkpoints/s2-pro",
+    default=checkpoint_path(),
 )
-@click.option("--device", type=str, default="cuda")
+@click.option("--device", type=str, default=default_device())
 @click.option("--compile/--no-compile", default=False)
 @click.option("--seed", type=int, default=42)
 @click.option("--half/--no-half", default=False)

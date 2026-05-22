@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+from fish_speech.env_config import decoder_checkpoint_path, default_device
 from fish_speech.utils.file import AUDIO_EXTENSIONS
 
 # register eval resolver
@@ -61,12 +62,12 @@ def load_model(config_name, checkpoint_path, device="cuda"):
 @click.option("--config-name", default="modded_dac_vq")
 @click.option(
     "--checkpoint-path",
-    default="checkpoints/openaudio-s1-mini/codec.pth",
+    default=str(decoder_checkpoint_path()),
 )
 @click.option(
     "--device",
     "-d",
-    default="cuda",
+    default=default_device(),
 )
 def main(input_path, output_path, config_name, checkpoint_path, device):
     model = load_model(config_name, checkpoint_path, device=device)
