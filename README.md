@@ -73,7 +73,7 @@ Start the local FastAPI server:
 ```bash
 fish-tts-server \
   --host 0.0.0.0 \
-  --port 8001 \
+  --port 8002 \
   --llama-checkpoint-path ./modelsweights/s2-pro \
   --decoder-checkpoint-path ./modelsweights/s2-pro/codec.pth \
   --storage-root ./storage/fish_speech_service \
@@ -81,6 +81,9 @@ fish-tts-server \
   --dtype float16 \
   --max-seq-len 4096
 ```
+
+The FastAPI server and client default to port `8002`. On macOS, the server reads `.env` before importing PyTorch and defaults to conservative MPS memory settings:
+`PYTORCH_ENABLE_MPS_FALLBACK=1`, `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.55`, and `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.75`.
 
 Synthesize with a reference audio and transcript:
 

@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 import httpx
 
 API_PREFIX = "/fishspeech"
-DEFAULT_SERVER_URL = "http://127.0.0.1:8001"
+DEFAULT_SERVER_URL = "http://127.0.0.1:8002"
 
 
 def _form_value(value: Any) -> str:

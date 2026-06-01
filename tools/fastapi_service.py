@@ -10,10 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Optional
 
+from dotenv import load_dotenv
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_PROJECT_ROOT / ".env")
+
 if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6")
-    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.8")
+    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.55")
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.75")
 
 _MPL_CACHE = Path(tempfile.gettempdir()) / "fish_speech_matplotlib"
 _MPL_CACHE.mkdir(parents=True, exist_ok=True)
@@ -648,7 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Launch a FastAPI server for Fish Speech voice clone.",
     )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--storage-root", default=None)
     parser.add_argument("--llama-checkpoint-path", default=None)
     parser.add_argument("--decoder-checkpoint-path", default=None)
