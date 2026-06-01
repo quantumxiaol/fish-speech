@@ -107,6 +107,7 @@ ffprobe.exe
 # Server Related
 # --------------
 /data_server/target/
+storage/
 
 # Test Files
 # ----------

@@ -66,6 +66,34 @@ Here are the official documents for Fish Audio S2, follow the instructions to ge
 >
 > **For vLLM Omni server, please read [vLLM-Omni Fish Speech S2 Pro Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/fishaudio/Fish-Speech-S2-Pro.md) and the [User Guide](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro).**
 
+### FastAPI Server and Client
+
+Start the local FastAPI server:
+
+```bash
+fish-tts-server \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --llama-checkpoint-path ./modelsweights/s2-pro \
+  --decoder-checkpoint-path ./modelsweights/s2-pro/codec.pth \
+  --storage-root ./storage/fish_speech_service \
+  --device mps \
+  --dtype float16 \
+  --max-seq-len 4096
+```
+
+Synthesize with a reference audio and transcript:
+
+```bash
+fish-tts-client voice-clone \
+  --ref-audio inputs/ref.wav \
+  --ref-text "Reference transcript text" \
+  --text "Text to synthesize" \
+  --download-to outputs/out.wav
+```
+
+If the virtual environment is not activated, use `.venv/bin/fish-tts-server` and `.venv/bin/fish-tts-client`.
+
 ### For LLM Agent
 
 ```

@@ -361,8 +361,10 @@ def generate(
     return seq
 
 
-def init_model(checkpoint_path, device, precision, compile=False):
-    model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
+def init_model(checkpoint_path, device, precision, compile=False, max_seq_len=None):
+    model = DualARTransformer.from_pretrained(
+        checkpoint_path, load_weights=True, max_length=max_seq_len
+    )
 
     model = model.to(device=device, dtype=precision)
     logger.info(f"Restored model from checkpoint")
@@ -752,13 +754,18 @@ def launch_thread_safe_queue(
     device,
     precision,
     compile: bool = False,
+    max_seq_len: int | None = None,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
 
     def worker():
         model, decode_one_token = init_model(
-            checkpoint_path, device, precision, compile=compile
+            checkpoint_path,
+            device,
+            precision,
+            compile=compile,
+            max_seq_len=max_seq_len,
         )
         with torch.device(device):
             model.setup_caches(
@@ -831,6 +838,7 @@ def launch_thread_safe_queue(
     type=click.Path(path_type=Path, exists=True),
     default=checkpoint_path(),
 )
+@click.option("--max-seq-len", type=int, default=None)
 @click.option("--device", type=str, default=default_device())
 @click.option("--compile/--no-compile", default=False)
 @click.option("--seed", type=int, default=42)
@@ -850,6 +858,7 @@ def main(
     top_k: int,
     temperature: float,
     checkpoint_path: Path,
+    max_seq_len: Optional[int],
     device: str,
     compile: bool,
     seed: int,
@@ -877,7 +886,11 @@ def main(
     logger.info("Loading model ...")
     t0 = time.time()
     model, decode_one_token = init_model(
-        checkpoint_path, device, precision, compile=compile
+        checkpoint_path,
+        device,
+        precision,
+        compile=compile,
+        max_seq_len=max_seq_len,
     )
     with torch.device(device):
         model.setup_caches(
