@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from loguru import logger
 
+from fish_speech.device_memory import empty_mps_cache
 from fish_speech.inference_engine.reference_loader import ReferenceLoader
 from fish_speech.inference_engine.utils import InferenceResult, wav_chunk_header
 from fish_speech.inference_engine.vq_manager import VQManager
@@ -20,7 +21,6 @@ from fish_speech.utils.schema import ServeTTSRequest
 
 
 class TTSInferenceEngine(ReferenceLoader, VQManager):
-
     def __init__(
         self,
         llama_queue: queue.Queue,
@@ -28,7 +28,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         precision: torch.dtype,
         compile: bool,
     ) -> None:
-
         super().__init__()
 
         self.llama_queue = llama_queue
@@ -118,10 +117,27 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             else:
                 break
 
-        # Clean up the memory
+        # Keep the existing CUDA cleanup behavior unchanged.
+        memory_stats = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
+        elif self.decoder_model.device.type == "mps":
+            # Do MPS cleanup outside the Llama worker so it cannot overlap
+            # decoder work on another thread.
+            memory_stats = empty_mps_cache(self.decoder_model.device)
+
+        if memory_stats is not None:
+            gib = 1024**3
+            logger.info(
+                "MPS memory cleanup: tensors {:.2f} -> {:.2f} GiB, "
+                "driver {:.2f} -> {:.2f} GiB, released {:.2f} GiB",
+                memory_stats.current_before / gib,
+                memory_stats.current_after / gib,
+                memory_stats.driver_before / gib,
+                memory_stats.driver_after / gib,
+                max(memory_stats.driver_before - memory_stats.driver_after, 0) / gib,
+            )
 
         # Edge case: no audio generated
         if len(segments) == 0:
