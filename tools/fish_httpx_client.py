@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -7,6 +8,8 @@ from typing import Any, Optional, Sequence
 import httpx
 
 API_PREFIX = "/fishspeech"
+ADMIN_SHUTDOWN_HEADER = "X-Fish-Speech-Admin"
+ADMIN_SHUTDOWN_VALUE = "shutdown"
 DEFAULT_SERVER_URL = "http://127.0.0.1:8002"
 
 
@@ -59,6 +62,56 @@ class FishSpeechHttpxClient:
 
     def health(self) -> dict[str, Any]:
         return self._json(self._client.get(f"{API_PREFIX}/health"))
+
+    def shutdown(
+        self,
+        *,
+        wait: bool = False,
+        wait_timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        payload = self._json(
+            self._client.post(
+                f"{API_PREFIX}/admin/shutdown",
+                headers={
+                    ADMIN_SHUTDOWN_HEADER: ADMIN_SHUTDOWN_VALUE,
+                    "Connection": "close",
+                },
+            )
+        )
+        if wait:
+            self.wait_until_stopped(timeout=wait_timeout)
+            payload["server_stopped"] = True
+        return payload
+
+    def wait_until_stopped(self, timeout: float = 30.0) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than 0")
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                response = self._client.get(
+                    f"{API_PREFIX}/health",
+                    headers={"Connection": "close"},
+                    timeout=max(min(remaining, 1.0), 0.05),
+                )
+                if response.status_code != 200:
+                    return
+                try:
+                    if response.json().get("status") != "ok":
+                        return
+                except (AttributeError, ValueError):
+                    return
+            except (httpx.ConnectError, httpx.RemoteProtocolError):
+                return
+            except httpx.TimeoutException:
+                pass
+            time.sleep(min(0.2, max(remaining, 0)))
+
+        raise FishSpeechClientError(
+            f"Server still responds after waiting {timeout:.1f} seconds for shutdown."
+        )
 
     def download_url(self, url: str, output_path: str | Path) -> Path:
         target = Path(output_path).expanduser().resolve()

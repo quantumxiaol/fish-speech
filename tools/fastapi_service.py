@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import platform
 import tempfile
@@ -8,7 +9,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Callable, Optional
 
 from dotenv import load_dotenv
 
@@ -31,7 +32,16 @@ import numpy as np
 import pyrootutils
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from loguru import logger
 from pydantic import BaseModel
@@ -53,6 +63,8 @@ from fish_speech.utils.file import audio_to_bytes  # noqa: E402
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest  # noqa: E402
 
 API_PREFIX = "/fishspeech"
+ADMIN_SHUTDOWN_HEADER = "X-Fish-Speech-Admin"
+ADMIN_SHUTDOWN_VALUE = "shutdown"
 DEFAULT_STORAGE_ROOT = Path("storage") / "fish_speech_service"
 SUPPORTED_FORMATS = {"wav", "flac", "mp3", "opus", "pcm"}
 
@@ -112,6 +124,19 @@ def _validate_audio_format(audio_format: str) -> str:
         allowed = ", ".join(sorted(SUPPORTED_FORMATS))
         raise HTTPException(status_code=422, detail=f"Unsupported format: {audio_format}. Allowed: {allowed}")
     return normalized
+
+
+def _is_loopback_request(request: Request) -> bool:
+    if request.client is None:
+        return False
+    try:
+        address = ipaddress.ip_address(request.client.host)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return mapped is not None and mapped.is_loopback
 
 
 def _write_audio(path: Path, audio: np.ndarray, sample_rate: int, audio_format: str) -> None:
@@ -221,6 +246,12 @@ class HealthResponse(BaseModel):
     max_seq_len: Optional[int]
     llama_checkpoint_path: str
     decoder_checkpoint_path: str
+    shutdown_pending: bool
+
+
+class ShutdownResponse(BaseModel):
+    status: str
+    reason: str
 
 
 class FileStore:
@@ -349,6 +380,92 @@ class ModelManager:
         raise RuntimeError("No audio generated, please check the input text.")
 
 
+class ServerShutdownController:
+    """Coordinate graceful shutdown without touching model code."""
+
+    def __init__(
+        self,
+        shutdown_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self._shutdown_callback = shutdown_callback
+        self._lock = threading.Lock()
+        self._active_tts_requests = 0
+        self._shutdown_pending = False
+        self._shutdown_callback_called = False
+        self._shutdown_reason: Optional[str] = None
+
+    @property
+    def configured(self) -> bool:
+        with self._lock:
+            return self._shutdown_callback is not None
+
+    @property
+    def shutdown_pending(self) -> bool:
+        with self._lock:
+            return self._shutdown_pending
+
+    @property
+    def shutdown_reason(self) -> Optional[str]:
+        with self._lock:
+            return self._shutdown_reason
+
+    def set_shutdown_callback(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._shutdown_pending:
+                raise RuntimeError(
+                    "Cannot replace shutdown callback after shutdown is pending."
+                )
+            self._shutdown_callback = callback
+
+    def begin_tts_request(self) -> bool:
+        with self._lock:
+            if self._shutdown_pending:
+                return False
+            self._active_tts_requests += 1
+            return True
+
+    def end_tts_request(self) -> None:
+        with self._lock:
+            if self._active_tts_requests <= 0:
+                raise RuntimeError("TTS request activity counter is unbalanced.")
+            self._active_tts_requests -= 1
+            should_execute = (
+                self._active_tts_requests == 0 and self._shutdown_pending
+            )
+
+        if should_execute:
+            self.execute_shutdown()
+
+    def request_shutdown(self, reason: str) -> bool:
+        with self._lock:
+            if self._shutdown_pending:
+                return False
+            self._shutdown_pending = True
+            self._shutdown_reason = reason
+            return True
+
+    def execute_shutdown(self) -> bool:
+        with self._lock:
+            if (
+                not self._shutdown_pending
+                or self._active_tts_requests > 0
+                or self._shutdown_callback_called
+            ):
+                return False
+            callback = self._shutdown_callback
+            if callback is None:
+                logger.error(
+                    "Shutdown requested, but no server shutdown callback is configured."
+                )
+                return False
+            self._shutdown_callback_called = True
+            reason = self._shutdown_reason
+
+        logger.warning("Graceful server shutdown requested: reason={}", reason)
+        callback()
+        return True
+
+
 def _stored_file_from_path(request: Request, store: FileStore, path: Path) -> StoredFile:
     relative = path.resolve().relative_to(store.root.resolve())
     parts = relative.parts
@@ -465,15 +582,31 @@ def _build_tts_request(
 def create_app(
     settings: Optional[ServiceSettings] = None,
     model_manager: Optional[ModelManager] = None,
+    shutdown_callback: Optional[Callable[[], None]] = None,
 ) -> FastAPI:
     app_settings = settings or ServiceSettings.from_env()
     manager = model_manager or ModelManager(app_settings)
     store = FileStore(app_settings.storage_root)
+    shutdown_controller = ServerShutdownController(
+        shutdown_callback=shutdown_callback,
+    )
 
     app = FastAPI(title="Fish Speech FastAPI Service")
     app.state.settings = app_settings
     app.state.model_manager = manager
     app.state.file_store = store
+    app.state.shutdown_controller = shutdown_controller
+
+    def tts_request_activity():
+        if not shutdown_controller.begin_tts_request():
+            raise HTTPException(
+                status_code=503,
+                detail="Server shutdown is pending; new TTS requests are not accepted.",
+            )
+        try:
+            yield
+        finally:
+            shutdown_controller.end_tts_request()
 
     @app.get(f"{API_PREFIX}/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -486,6 +619,36 @@ def create_app(
             max_seq_len=app_settings.max_seq_len,
             llama_checkpoint_path=str(app_settings.llama_checkpoint_path),
             decoder_checkpoint_path=str(app_settings.decoder_checkpoint_path),
+            shutdown_pending=shutdown_controller.shutdown_pending,
+        )
+
+    @app.post(
+        f"{API_PREFIX}/admin/shutdown",
+        response_model=ShutdownResponse,
+        status_code=202,
+    )
+    def shutdown(request: Request, background_tasks: BackgroundTasks) -> ShutdownResponse:
+        if not _is_loopback_request(request):
+            raise HTTPException(
+                status_code=403, detail="Server shutdown is restricted to loopback clients."
+            )
+        if request.headers.get(ADMIN_SHUTDOWN_HEADER) != ADMIN_SHUTDOWN_VALUE:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing or invalid {ADMIN_SHUTDOWN_HEADER} confirmation header.",
+            )
+        if not shutdown_controller.configured:
+            raise HTTPException(
+                status_code=503,
+                detail="Server shutdown callback is not configured.",
+            )
+
+        accepted = shutdown_controller.request_shutdown("admin_request")
+        if accepted:
+            background_tasks.add_task(shutdown_controller.execute_shutdown)
+        return ShutdownResponse(
+            status="accepted" if accepted else "already_pending",
+            reason=shutdown_controller.shutdown_reason or "admin_request",
         )
 
     @app.get(f"{API_PREFIX}/files/{{category}}/{{request_id}}/{{filename:path}}", name="download_file")
@@ -499,6 +662,7 @@ def create_app(
     async def tts_voice_clone(
         request: Request,
         ref_audio: Annotated[UploadFile, File(...)],
+        _activity: None = Depends(tts_request_activity),
         text: Annotated[Optional[str], Form()] = None,
         text_file: Annotated[Optional[UploadFile], File()] = None,
         ref_text: Annotated[Optional[str], Form()] = None,
@@ -564,6 +728,7 @@ def create_app(
     async def tts_voice_clone_batch_file(
         request: Request,
         ref_audio: Annotated[UploadFile, File(...)],
+        _activity: None = Depends(tts_request_activity),
         text_file: Annotated[Optional[UploadFile], File()] = None,
         text: Annotated[Optional[list[str]], Form()] = None,
         ref_text: Annotated[Optional[str], Form()] = None,

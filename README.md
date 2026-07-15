@@ -72,7 +72,7 @@ Start the local FastAPI server:
 
 ```bash
 fish-tts-server \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8002 \
   --llama-checkpoint-path ./modelsweights/s2-pro \
   --decoder-checkpoint-path ./modelsweights/s2-pro/codec.pth \
@@ -94,6 +94,18 @@ fish-tts-client voice-clone \
   --text "Text to synthesize" \
   --download-to outputs/out.wav
 ```
+
+Before starting another memory-intensive local job, gracefully stop the server
+and wait until port `8002` is no longer responding:
+
+```bash
+fish-tts-client shutdown
+```
+
+The shutdown API only accepts loopback clients and requires a confirmation
+header supplied automatically by `fish-tts-client`. Because shutdown exits the
+server process, start `fish-tts-server` again before the next synthesis session.
+The server does not shut down automatically when it is idle.
 
 If the virtual environment is not activated, use `.venv/bin/fish-tts-server` and `.venv/bin/fish-tts-client`.
 
