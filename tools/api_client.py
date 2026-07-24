@@ -94,6 +94,12 @@ def parse_args():
         "--chunk_length", type=int, default=300, help="Chunk length for synthesis"
     )
     parser.add_argument(
+        "--iterative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Split long text into iterative prompt batches",
+    )
+    parser.add_argument(
         "--top_p", type=float, default=0.8, help="Top-p sampling for synthesis"
     )
     parser.add_argument(
@@ -171,6 +177,7 @@ if __name__ == "__main__":
         "latency": args.latency,
         "max_new_tokens": args.max_new_tokens,
         "chunk_length": args.chunk_length,
+        "iterative_prompt": args.iterative_prompt,
         "top_p": args.top_p,
         "repetition_penalty": args.repetition_penalty,
         "temperature": args.temperature,

@@ -20,6 +20,11 @@ from tools.fish_httpx_client import (  # noqa: E402
 def _add_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--chunk-length", type=int, default=None)
+    parser.add_argument(
+        "--iterative-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=None)
@@ -31,6 +36,7 @@ def _collect_generation_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     mapping = {
         "max_new_tokens": args.max_new_tokens,
         "chunk_length": args.chunk_length,
+        "iterative_prompt": args.iterative_prompt,
         "top_p": args.top_p,
         "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,

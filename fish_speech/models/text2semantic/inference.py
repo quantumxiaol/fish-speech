@@ -57,8 +57,24 @@ def logits_to_probs(
     logits,
     temperature: torch.Tensor,
     top_p: torch.Tensor,
-    top_k: int,  # 注意: 我看到你传进来的是 int，这很关键
+    top_k: int,
+    repetition_penalty: torch.Tensor,
+    previous_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if previous_tokens is not None:
+        previous_tokens = previous_tokens.long()
+        previous_scores = torch.gather(logits, dim=-1, index=previous_tokens)
+        penalized_scores = torch.where(
+            previous_scores < 0,
+            previous_scores * repetition_penalty,
+            previous_scores / repetition_penalty,
+        )
+        # Use the out-of-place form so normal and RAS fallback sampling both
+        # start from the same unmodified logits.
+        logits = logits.scatter(
+            dim=-1, index=previous_tokens, src=penalized_scores
+        )
+
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
 
@@ -84,12 +100,16 @@ def sample(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: int,
+    repetition_penalty: torch.Tensor,
+    previous_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     probs = logits_to_probs(
         logits=logits[0, -1],
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        previous_tokens=previous_tokens,
     )
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
@@ -102,6 +122,7 @@ def decode_one_token_ar(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: int,
+    repetition_penalty: torch.Tensor,
     semantic_logit_bias: torch.Tensor,
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
@@ -121,7 +142,12 @@ def decode_one_token_ar(
 
     # Normal sample
     main_token_normal = sample(
-        biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
+        biased_logits,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        previous_tokens=previous_tokens[0] if previous_tokens is not None else None,
     )[0]
 
     # RAS: also sample with high temp to use as fallback if token repeats
@@ -130,7 +156,12 @@ def decode_one_token_ar(
     )
     high_top_p = torch.tensor(RAS_HIGH_TOP_P, device=top_p.device, dtype=top_p.dtype)
     main_token_high = sample(
-        biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
+        biased_logits,
+        temperature=high_temp,
+        top_p=high_top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        previous_tokens=previous_tokens[0] if previous_tokens is not None else None,
     )[0]
 
     # Use high-temp sample if: token is semantic AND token is in previous window
@@ -170,6 +201,12 @@ def decode_one_token_ar(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            previous_tokens=(
+                previous_tokens[codebook_idx + 1]
+                if previous_tokens is not None
+                else None
+            ),
         )[0]
 
         hidden_states = model.fast_embeddings(a)
@@ -191,17 +228,23 @@ def decode_n_tokens(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: int,
+    repetition_penalty: torch.Tensor,
     semantic_logit_bias: torch.Tensor,
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
 ):
-    # Rolling window for RAS (Repetition Aware Sampling)
-    previous_tokens = torch.zeros(
-        (model.config.num_codebooks + 1, RAS_WIN_SIZE),
-        dtype=torch.int,
-        device=cur_token.device,
-    )
+    codebook_dim = model.config.num_codebooks + 1
+    if num_new_tokens <= 0:
+        return torch.empty(
+            (codebook_dim, 0), dtype=cur_token.dtype, device=cur_token.device
+        )
+
+    # RAS and repetition penalty only need set membership, not chronological
+    # ordering. Seed the fixed-size ring with the prefill token so token 0 is
+    # not treated as fake history for fast codebooks.
+    first_token = cur_token.view(codebook_dim, -1)[:, -1]
+    previous_tokens = first_token[:, None].expand(-1, RAS_WIN_SIZE).clone()
     # Accumulate all generated tokens (the actual output)
     new_tokens = []
 
@@ -218,6 +261,7 @@ def decode_n_tokens(
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=repetition_penalty,
                 semantic_logit_bias=semantic_logit_bias,
                 audio_masks=audio_masks,
                 audio_parts=audio_parts,
@@ -225,11 +269,10 @@ def decode_n_tokens(
 
         input_pos += 1
         cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
-        # Roll RAS window left and insert new token at end
-        previous_tokens = previous_tokens.roll(-1, dims=1)
-        previous_tokens[:, -1] = next_token.view(model.config.num_codebooks + 1, -1)[
-            :, 0
-        ]
+        # Reuse the ring buffer instead of allocating a new tensor with roll().
+        previous_tokens[:, i % RAS_WIN_SIZE] = next_token.view(
+            codebook_dim, -1
+        )[:, 0]
         new_tokens.append(next_token)
 
         if cur_token[0, 0, -1] == im_end_id:
@@ -303,9 +346,13 @@ def generate(
     temp_val = sampling_kwargs.get("temperature", 1.0)
     top_p_val = sampling_kwargs.get("top_p", 0.9)
     top_k_val = sampling_kwargs.get("top_k", 30)
+    repetition_penalty_val = sampling_kwargs.get("repetition_penalty", 1.1)
 
     temperature = torch.tensor(temp_val, device=device, dtype=dtype)
     top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
+    repetition_penalty = torch.tensor(
+        repetition_penalty_val, device=device, dtype=dtype
+    )
 
     # Build semantic logit bias: 0 for semantic tokens + im_end, -inf for all others
     vocab_size = model.config.vocab_size
@@ -330,6 +377,7 @@ def generate(
         temperature,
         top_p,
         top_k_val,
+        repetition_penalty,
         semantic_logit_bias,
         audio_masks,
         audio_parts,
@@ -347,6 +395,7 @@ def generate(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k_val,
+        repetition_penalty=repetition_penalty,
         semantic_logit_bias=semantic_logit_bias,
         audio_masks=audio_masks,
         audio_parts=audio_parts,
@@ -524,6 +573,70 @@ def group_turns_into_batches(
     return batches
 
 
+def split_text_into_batches(text: str, max_bytes: int) -> list[str]:
+    """Split plain text without breaking UTF-8 characters.
+
+    Prefer sentence, clause, and whitespace boundaries. If no boundary exists
+    before the byte limit, fall back to a character boundary.
+    """
+    if max_bytes <= 0:
+        raise ValueError("chunk_length must be greater than 0")
+
+    remaining = text.strip()
+    if not remaining:
+        return [text]
+
+    boundaries = frozenset(".!?。！？,，;；:：、\n\t ")
+    batches: list[str] = []
+
+    while len(remaining.encode("utf-8")) > max_bytes:
+        current: list[str] = []
+        current_bytes = 0
+        last_boundary = 0
+
+        for char in remaining:
+            char_bytes = len(char.encode("utf-8"))
+            if current and current_bytes + char_bytes > max_bytes:
+                break
+            current.append(char)
+            current_bytes += char_bytes
+            if char in boundaries:
+                last_boundary = len(current)
+
+        cut = last_boundary or len(current)
+        if cut == 0:
+            # max_bytes is smaller than one character; keep forward progress.
+            cut = 1
+
+        chunk = "".join(current[:cut]).strip()
+        if chunk:
+            batches.append(chunk)
+        remaining = ("".join(current[cut:]) + remaining[len(current) :]).strip()
+
+    if remaining:
+        batches.append(remaining)
+
+    return batches
+
+
+def prepare_text_batches(
+    text: str,
+    *,
+    iterative_prompt: bool,
+    chunk_length: int,
+) -> list[str]:
+    if not iterative_prompt:
+        return [text]
+
+    turns = split_text_by_speaker(text)
+    if turns:
+        return group_turns_into_batches(
+            turns, max_speakers=5, max_bytes=chunk_length
+        )
+
+    return split_text_into_batches(text, max_bytes=chunk_length)
+
+
 def generate_long(
     *,
     model,
@@ -543,6 +656,7 @@ def generate_long(
     prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
+    assert 0 < repetition_penalty <= 2, "repetition_penalty must be in (0, 2]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
@@ -601,16 +715,16 @@ def generate_long(
         )
     )
 
-    # Split text by speaker and group into batches
-    turns = split_text_by_speaker(text)
-    if turns:
-        batches = group_turns_into_batches(
-            turns, max_speakers=5, max_bytes=chunk_length
-        )
-    else:
-        batches = [text]
-
-    logger.info(f"Split into {len(turns)} turns, grouped into {len(batches)} batches")
+    batches = prepare_text_batches(
+        text,
+        iterative_prompt=iterative_prompt,
+        chunk_length=chunk_length,
+    )
+    logger.info(
+        "Iterative prompt: {}, grouped text into {} batch(es)",
+        iterative_prompt,
+        len(batches),
+    )
 
     for sample_idx in range(num_samples):
         if torch.cuda.is_available():
@@ -689,6 +803,7 @@ def generate_long(
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=repetition_penalty,
             )
 
             if sample_idx == 0 and batch_idx == 0 and compile:

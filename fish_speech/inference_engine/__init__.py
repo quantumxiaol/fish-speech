@@ -173,7 +173,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             repetition_penalty=req.repetition_penalty,
             temperature=req.temperature,
             compile=self.compile,
-            iterative_prompt=req.chunk_length > 0,
+            iterative_prompt=req.iterative_prompt,
             chunk_length=req.chunk_length,
             prompt_tokens=prompt_tokens,
             prompt_text=prompt_texts,

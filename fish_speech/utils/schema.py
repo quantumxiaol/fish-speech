@@ -81,6 +81,7 @@ class ServeReferenceAudio(BaseModel):
 class ServeTTSRequest(BaseModel):
     text: str
     chunk_length: Annotated[int, conint(ge=100, le=1000, strict=True)] = 200
+    iterative_prompt: bool = True
     # Audio format
     format: Literal["wav", "pcm", "mp3", "opus"] = "wav"
     # Latency mode (used by api.fish.audio; "normal" or "balanced")

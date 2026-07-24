@@ -30,11 +30,15 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                         with gr.Tab(label=i18n("Advanced Config")):
                             with gr.Row():
                                 chunk_length = gr.Slider(
-                                    label=i18n("Iterative Prompt Length, 0 means off"),
+                                    label=i18n("Iterative Prompt Length"),
                                     minimum=100,
                                     maximum=400,
                                     value=300,
                                     step=8,
+                                )
+                                iterative_prompt = gr.Checkbox(
+                                    label=i18n("Use Iterative Prompt"),
+                                    value=True,
                                 )
 
                                 max_new_tokens = gr.Slider(
@@ -142,6 +146,7 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                 reference_text,
                 max_new_tokens,
                 chunk_length,
+                iterative_prompt,
                 top_p,
                 repetition_penalty,
                 temperature,

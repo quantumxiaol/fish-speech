@@ -92,8 +92,15 @@ fish-tts-client voice-clone \
   --ref-audio inputs/ref.wav \
   --ref-text "Reference transcript text" \
   --text "Text to synthesize" \
+  --repetition-penalty 1.1 \
   --download-to outputs/out.wav
 ```
+
+Long text is split into iterative prompt batches by default, using
+`--chunk-length` as the UTF-8 byte limit. Pass `--no-iterative-prompt` to
+synthesize the request as one batch. The equivalent FastAPI form field is
+`iterative_prompt=true|false`; `/v1/tts` accepts the same field in
+`ServeTTSRequest`.
 
 Before starting another memory-intensive local job, gracefully stop the server
 and wait until port `8002` is no longer responding:
