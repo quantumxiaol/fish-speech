@@ -182,6 +182,17 @@ def _optional_int(value: Optional[str]) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _perf_sample_frames_from_env() -> int:
+    parsed = int(os.getenv("FISH_TTS_PERF_SAMPLE_FRAMES", "16"))
+    if not 1 <= parsed <= 64:
+        raise ValueError("FISH_TTS_PERF_SAMPLE_FRAMES must be between 1 and 64")
+    return parsed
+
+
 @dataclass
 class ServiceSettings:
     storage_root: Path
@@ -193,6 +204,8 @@ class ServiceSettings:
     compile: bool
     max_seq_len: Optional[int]
     mps_profile: bool = False
+    perf_detail: bool = False
+    perf_sample_frames: int = 16
 
     @classmethod
     def from_env(cls) -> "ServiceSettings":
@@ -210,10 +223,14 @@ class ServiceSettings:
             ),
             device=default_device(fallback="") or None,
             dtype=os.getenv("FISH_TTS_DTYPE") or None,
-            compile=os.getenv("FISH_TTS_COMPILE", "").lower() in {"1", "true", "yes"},
+            compile=_env_flag("FISH_TTS_COMPILE"),
             max_seq_len=_optional_int(os.getenv("FISH_TTS_MAX_SEQ_LEN", "4096")),
-            mps_profile=os.getenv("FISH_TTS_MPS_PROFILE", "").lower()
-            in {"1", "true", "yes"},
+            mps_profile=_env_flag("FISH_TTS_MPS_PROFILE"),
+            perf_detail=(
+                _env_flag("FISH_TTS_DEBUG")
+                or _env_flag("FISH_TTS_PERF_DETAIL")
+            ),
+            perf_sample_frames=_perf_sample_frames_from_env(),
         )
 
 
@@ -256,6 +273,8 @@ class HealthResponse(BaseModel):
     decoder_checkpoint_path: str
     shutdown_pending: bool
     mps_profile: bool
+    perf_detail: bool
+    perf_sample_frames: int
     mps_tensor_gib: Optional[float]
     mps_driver_gib: Optional[float]
     mps_recommended_gib: Optional[float]
@@ -346,6 +365,13 @@ class ModelManager:
         self._engine: Optional[TTSInferenceEngine] = None
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        if settings.perf_detail:
+            logger.warning(
+                "Semantic perf detail is enabled: up to {} sampled frames "
+                "will use synchronized stage timing. Diagnostic requests are "
+                "not production performance benchmarks.",
+                settings.perf_sample_frames,
+            )
 
     @property
     def loaded(self) -> bool:
@@ -384,6 +410,8 @@ class ModelManager:
                 decoder_model=decoder_model,
                 precision=self.dtype,
                 compile=self.settings.compile,
+                perf_detail=self.settings.perf_detail,
+                perf_sample_frames=self.settings.perf_sample_frames,
             )
             return self._engine
 
@@ -657,6 +685,8 @@ def create_app(
             decoder_checkpoint_path=str(app_settings.decoder_checkpoint_path),
             shutdown_pending=shutdown_controller.shutdown_pending,
             mps_profile=app_settings.mps_profile,
+            perf_detail=app_settings.perf_detail,
+            perf_sample_frames=app_settings.perf_sample_frames,
             mps_tensor_gib=(
                 mps_memory.current / gib if mps_memory is not None else None
             ),
@@ -912,5 +942,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--mps-profile",
         action="store_true",
         help="Emit MPS OS signposts for Instruments Metal System Trace.",
+    )
+    parser.add_argument(
+        "--perf-detail",
+        action="store_true",
+        help=(
+            "Synchronize selected semantic frames to measure Slow AR, sampler, "
+            "and Fast AR. Diagnostic only; changes request timing."
+        ),
+    )
+    parser.add_argument(
+        "--perf-sample-frames",
+        type=int,
+        default=None,
+        choices=range(1, 65),
+        metavar="1-64",
+        help="Maximum semantic frames sampled by --perf-detail (default: 16).",
     )
     return parser

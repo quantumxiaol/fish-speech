@@ -26,6 +26,7 @@ from fish_speech.device_memory import (
     AcceleratorTimer,
     get_cuda_memory_snapshot,
     get_mps_memory_snapshot,
+    synchronize_device,
 )
 from fish_speech.env_config import checkpoint_path, default_device
 from fish_speech.tokenizer import IM_END_TOKEN
@@ -56,6 +57,79 @@ def multinomial_sample_one_no_sync(probs_sort):
 RAS_WIN_SIZE = 10  # window for Repetition Aware Sampling
 RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
+
+
+@dataclass(frozen=True)
+class PerfDetailSample:
+    frame_index: int
+    slow_transformer_ms: float
+    output_projection_ms: float
+    slow_ar_and_output_ms: float
+    main_sampler_ms: float
+    fast_ar_and_sampler_ms: float
+    total_ms: float
+
+
+def should_sample_perf_detail(
+    frame_index: int,
+    samples_collected: int,
+    max_samples: int,
+) -> bool:
+    """Sample early frames densely and later context every 16 frames."""
+    if max_samples <= 0 or samples_collected >= max_samples:
+        return False
+    return frame_index < 4 or (frame_index >= 16 and frame_index % 16 == 0)
+
+
+def summarize_perf_detail(
+    samples: list[PerfDetailSample],
+) -> dict[str, float]:
+    if not samples:
+        return {}
+
+    def mean(attribute: str) -> float:
+        return sum(getattr(sample, attribute) for sample in samples) / len(samples)
+
+    first_count = min(4, len(samples))
+    last_count = min(4, len(samples))
+    first_total = sum(sample.total_ms for sample in samples[:first_count]) / first_count
+    last_total = sum(sample.total_ms for sample in samples[-last_count:]) / last_count
+    total_stage_ms = sum(sample.total_ms for sample in samples)
+    slow_transformer_ms = sum(sample.slow_transformer_ms for sample in samples)
+    output_projection_ms = sum(sample.output_projection_ms for sample in samples)
+    slow_stage_ms = sum(sample.slow_ar_and_output_ms for sample in samples)
+    sampler_stage_ms = sum(sample.main_sampler_ms for sample in samples)
+    fast_stage_ms = sum(sample.fast_ar_and_sampler_ms for sample in samples)
+
+    return {
+        "perf_detail_sample_count": float(len(samples)),
+        "perf_slow_transformer_mean_ms": mean("slow_transformer_ms"),
+        "perf_output_projection_mean_ms": mean("output_projection_ms"),
+        "perf_slow_ar_and_output_mean_ms": mean("slow_ar_and_output_ms"),
+        "perf_main_sampler_mean_ms": mean("main_sampler_ms"),
+        "perf_fast_ar_and_sampler_mean_ms": mean("fast_ar_and_sampler_ms"),
+        "perf_profiled_frame_mean_ms": mean("total_ms"),
+        "perf_slow_transformer_share": (
+            slow_transformer_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_output_projection_share": (
+            output_projection_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_slow_ar_and_output_share": (
+            slow_stage_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_main_sampler_share": (
+            sampler_stage_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_fast_ar_and_sampler_share": (
+            fast_stage_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_first_frames_mean_ms": first_total,
+        "perf_last_frames_mean_ms": last_total,
+        "perf_context_latency_ratio": (
+            last_total / first_total if first_total > 0 else 0.0
+        ),
+    }
 
 
 def log_device_memory(label: str, device: str | torch.device) -> None:
@@ -110,9 +184,7 @@ def logits_to_probs(
         )
         # Use the out-of-place form so normal and RAS fallback sampling both
         # start from the same unmodified logits.
-        logits = logits.scatter(
-            dim=-1, index=previous_tokens, src=penalized_scores
-        )
+        logits = logits.scatter(dim=-1, index=previous_tokens, src=penalized_scores)
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
@@ -166,15 +238,32 @@ def decode_one_token_ar(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     previous_tokens: Optional[torch.Tensor] = None,
+    kv_len: Optional[int] = None,
+    perf_sample: Optional[dict[str, float]] = None,
 ) -> torch.Tensor:
+    if perf_sample is not None:
+        # Diagnostic mode only: isolate the three data-dependent stages with
+        # explicit boundaries. Normal inference never enters this branch.
+        synchronize_device(x.device)
+        frame_start = time.perf_counter()
+        stage_start = frame_start
+
     forward_result = model.forward_generate(
         x,
         input_pos,
         audio_masks=audio_masks,
         audio_parts=audio_parts,
+        kv_len=kv_len,
+        perf_sample=perf_sample,
     )
     logits = forward_result.logits  # (1, 1, vocab_size)
     hidden_states = forward_result.hidden_states
+
+    if perf_sample is not None:
+        synchronize_device(x.device)
+        stage_end = time.perf_counter()
+        perf_sample["slow_ar_and_output_ms"] = (stage_end - stage_start) * 1000
+        stage_start = stage_end
 
     # Apply constrained decoding: only allow semantic tokens + im_end
     biased_logits = logits + semantic_logit_bias
@@ -217,6 +306,12 @@ def decode_one_token_ar(
 
     codebooks = [main_token_normal]
 
+    if perf_sample is not None:
+        synchronize_device(x.device)
+        stage_end = time.perf_counter()
+        perf_sample["main_sampler_ms"] = (stage_end - stage_start) * 1000
+        stage_start = stage_end
+
     input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
     model.forward_generate_fast(hidden_states, input_pos)
 
@@ -253,6 +348,12 @@ def decode_one_token_ar(
 
     codebooks = torch.stack(codebooks, dim=1)
 
+    if perf_sample is not None:
+        synchronize_device(x.device)
+        stage_end = time.perf_counter()
+        perf_sample["fast_ar_and_sampler_ms"] = (stage_end - stage_start) * 1000
+        perf_sample["total_ms"] = (stage_end - frame_start) * 1000
+
     # Only delete references, let Python GC handle cleanup
     del logits, hidden_states, forward_result
 
@@ -272,12 +373,21 @@ def decode_n_tokens(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
+    kv_start_pos: Optional[int] = None,
+    perf_detail: bool = False,
+    perf_sample_frames: int = 16,
+    perf_samples: Optional[list[PerfDetailSample]] = None,
 ):
     codebook_dim = model.config.num_codebooks + 1
     if num_new_tokens <= 0:
         return torch.empty(
             (codebook_dim, 0), dtype=cur_token.dtype, device=cur_token.device
         )
+
+    if kv_start_pos is None:
+        # Compatibility fallback for direct callers. Production generation
+        # passes the Python position explicitly, avoiding a device sync here.
+        kv_start_pos = int(input_pos[0].item())
 
     # RAS and repetition penalty only need set membership, not chronological
     # ordering. Seed the fixed-size ring with the prefill token so token 0 is
@@ -299,27 +409,64 @@ def decode_n_tokens(
         bar_format="{desc}: {n_fmt} tokens [{elapsed}, {rate_fmt}]",
     )
     for i in progress:
+        perf_sample = None
+        if perf_detail and should_sample_perf_detail(
+            frame_index=i,
+            samples_collected=len(perf_samples or []),
+            max_samples=perf_sample_frames,
+        ):
+            perf_sample = {}
+
         with sdpa_kernel(SDPBackend.MATH):
-            next_token = decode_one_token(
-                model=model,
-                x=cur_token,
-                input_pos=input_pos,
-                previous_tokens=previous_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                semantic_logit_bias=semantic_logit_bias,
-                audio_masks=audio_masks,
-                audio_parts=audio_parts,
-            ).clone()
+            if perf_sample is None:
+                next_token = decode_one_token(
+                    model=model,
+                    x=cur_token,
+                    input_pos=input_pos,
+                    kv_len=kv_start_pos + i + 1,
+                    previous_tokens=previous_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                ).clone()
+            else:
+                next_token = decode_one_token(
+                    model=model,
+                    x=cur_token,
+                    input_pos=input_pos,
+                    kv_len=kv_start_pos + i + 1,
+                    previous_tokens=previous_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                    perf_sample=perf_sample,
+                ).clone()
+
+        if perf_sample is not None and perf_samples is not None:
+            perf_samples.append(
+                PerfDetailSample(
+                    frame_index=i,
+                    slow_transformer_ms=perf_sample["slow_transformer_ms"],
+                    output_projection_ms=perf_sample["output_projection_ms"],
+                    slow_ar_and_output_ms=perf_sample["slow_ar_and_output_ms"],
+                    main_sampler_ms=perf_sample["main_sampler_ms"],
+                    fast_ar_and_sampler_ms=perf_sample["fast_ar_and_sampler_ms"],
+                    total_ms=perf_sample["total_ms"],
+                )
+            )
 
         input_pos += 1
         cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
         # Reuse the ring buffer instead of allocating a new tensor with roll().
-        previous_tokens[:, i % RAS_WIN_SIZE] = next_token.view(
-            codebook_dim, -1
-        )[:, 0]
+        previous_tokens[:, i % RAS_WIN_SIZE] = next_token.view(codebook_dim, -1)[:, 0]
         new_tokens.append(next_token)
 
         if cur_token[0, 0, -1] == im_end_id:
@@ -360,6 +507,8 @@ def generate(
     decode_one_token=decode_one_token_ar,
     num_samples: int = 1,
     metrics: Optional[dict[str, float]] = None,
+    perf_detail: bool = False,
+    perf_sample_frames: int = 16,
     **sampling_kwargs,
 ):
     """
@@ -433,6 +582,7 @@ def generate(
     ar_decode_timer = AcceleratorTimer(device)
     semantic_timer.start()
     prefill_timer.start()
+    prefill_perf_sample: dict[str, float] | None = {} if perf_detail else None
     first_token = prefill_decode(
         model,
         prompt.view(1, codebook_dim, -1),
@@ -444,6 +594,8 @@ def generate(
         semantic_logit_bias,
         audio_masks,
         audio_parts,
+        kv_len=T,
+        perf_sample=prefill_perf_sample,
     )
     prefill_timer.stop()
     seq[:, T : T + 1] = first_token
@@ -452,6 +604,7 @@ def generate(
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
     ar_decode_timer.start()
+    perf_samples: list[PerfDetailSample] = []
     x = decode_n_tokens(
         model,
         first_token.view(1, codebook_dim, -1),
@@ -465,6 +618,10 @@ def generate(
         audio_masks=audio_masks,
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
+        kv_start_pos=T,
+        perf_detail=perf_detail,
+        perf_sample_frames=perf_sample_frames,
+        perf_samples=perf_samples,
     )
     ar_decode_timer.stop()
     semantic_timer.stop()
@@ -484,6 +641,48 @@ def generate(
             metrics["ar_decode_accelerator_ms"] = ar_decode_accelerator_ms
         if semantic_accelerator_ms is not None:
             metrics["semantic_accelerator_ms"] = semantic_accelerator_ms
+        if prefill_perf_sample is not None:
+            metrics.update(
+                {
+                    f"perf_prefill_{key}": value
+                    for key, value in prefill_perf_sample.items()
+                }
+            )
+        metrics.update(summarize_perf_detail(perf_samples))
+
+    if perf_detail and perf_samples:
+        detail_summary = summarize_perf_detail(perf_samples)
+        logger.warning(
+            "Perf detail uses synchronized sampled frames and is diagnostic "
+            "only; do not compare this request's RTF with normal inference."
+        )
+        logger.info(
+            "Perf detail sampled frames: {}",
+            ",".join(str(sample.frame_index) for sample in perf_samples),
+        )
+        logger.info(
+            "Perf detail per sampled frame: slow_transformer={:.3f}ms "
+            "({:.1%}), output_projection={:.3f}ms ({:.1%}), "
+            "slow_ar+output={:.3f}ms ({:.1%}), "
+            "main_sampler={:.3f}ms ({:.1%}), "
+            "fast_ar+residual_sampler={:.3f}ms ({:.1%}), "
+            "profiled_total={:.3f}ms, context first/last={:.3f}/{:.3f}ms "
+            "(ratio {:.3f})",
+            detail_summary["perf_slow_transformer_mean_ms"],
+            detail_summary["perf_slow_transformer_share"],
+            detail_summary["perf_output_projection_mean_ms"],
+            detail_summary["perf_output_projection_share"],
+            detail_summary["perf_slow_ar_and_output_mean_ms"],
+            detail_summary["perf_slow_ar_and_output_share"],
+            detail_summary["perf_main_sampler_mean_ms"],
+            detail_summary["perf_main_sampler_share"],
+            detail_summary["perf_fast_ar_and_sampler_mean_ms"],
+            detail_summary["perf_fast_ar_and_sampler_share"],
+            detail_summary["perf_profiled_frame_mean_ms"],
+            detail_summary["perf_first_frames_mean_ms"],
+            detail_summary["perf_last_frames_mean_ms"],
+            detail_summary["perf_context_latency_ratio"],
+        )
     seq = seq[:, : T + 1 + x.size(1)]
     seq[:, T + 1 :] = x
 
@@ -714,9 +913,7 @@ def prepare_text_batches(
 
     turns = split_text_by_speaker(text)
     if turns:
-        return group_turns_into_batches(
-            turns, max_speakers=5, max_bytes=chunk_length
-        )
+        return group_turns_into_batches(turns, max_speakers=5, max_bytes=chunk_length)
 
     return split_text_into_batches(text, max_bytes=chunk_length)
 
@@ -734,6 +931,8 @@ def generate_long(
     repetition_penalty: float = 1.1,
     temperature: float = 1.0,
     compile: bool = False,
+    perf_detail: bool = False,
+    perf_sample_frames: int = 16,
     iterative_prompt: bool = True,
     chunk_length: int = 512,
     prompt_text: Optional[Union[str, list[str]]] = None,
@@ -742,6 +941,10 @@ def generate_long(
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < repetition_penalty <= 2, "repetition_penalty must be in (0, 2]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
+    if perf_detail and compile:
+        raise ValueError("perf_detail is not supported together with torch.compile")
+    if not 1 <= perf_sample_frames <= 64:
+        raise ValueError("perf_sample_frames must be between 1 and 64")
 
     use_prompt = bool(prompt_text) and bool(prompt_tokens)
     if use_prompt and isinstance(prompt_text, str):
@@ -749,9 +952,9 @@ def generate_long(
         prompt_tokens = [prompt_tokens]
 
     if use_prompt:
-        assert len(prompt_text) == len(
-            prompt_tokens
-        ), "Prompt text and tokens must have the same length"
+        assert len(prompt_text) == len(prompt_tokens), (
+            "Prompt text and tokens must have the same length"
+        )
 
     if prompt_tokens:
         prompt_tokens = [i.cpu() for i in prompt_tokens]
@@ -889,6 +1092,8 @@ def generate_long(
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
                 metrics=generation_metrics,
+                perf_detail=perf_detail,
+                perf_sample_frames=perf_sample_frames,
             )
 
             if sample_idx == 0 and batch_idx == 0 and compile:
@@ -906,15 +1111,11 @@ def generate_long(
             semantic_frames = codes.size(1)
             prefill_wall_ms = generation_metrics.get("prefill_wall_ms", 0.0)
             ar_decode_wall_ms = generation_metrics.get("ar_decode_wall_ms", 0.0)
-            prefill_accelerator_ms = generation_metrics.get(
-                "prefill_accelerator_ms"
-            )
+            prefill_accelerator_ms = generation_metrics.get("prefill_accelerator_ms")
             ar_decode_accelerator_ms = generation_metrics.get(
                 "ar_decode_accelerator_ms"
             )
-            semantic_accelerator_ms = generation_metrics.get(
-                "semantic_accelerator_ms"
-            )
+            semantic_accelerator_ms = generation_metrics.get("semantic_accelerator_ms")
             semantic_wall_ms = generation_metrics.get("semantic_wall_ms", 0.0)
             semantic_seconds = semantic_wall_ms / 1000
             frames_per_second = (
@@ -977,22 +1178,25 @@ def generate_long(
                 action="sample",
                 codes=codes,
                 text=batch_text,
-                metrics=({
-                    "prompt_build_wall_ms": prompt_build_seconds * 1000,
-                    "prefill_wall_ms": prefill_wall_ms,
-                    "ar_decode_wall_ms": ar_decode_wall_ms,
-                    "semantic_wall_ms": semantic_wall_ms,
-                    "semantic_frames": float(semantic_frames),
-                    "batch_wall_ms": batch_seconds * 1000,
-                } | {
-                    key: value
-                    for key, value in {
-                        "prefill_accelerator_ms": prefill_accelerator_ms,
-                        "ar_decode_accelerator_ms": ar_decode_accelerator_ms,
-                        "semantic_accelerator_ms": semantic_accelerator_ms,
-                    }.items()
-                    if value is not None
-                }),
+                metrics=(
+                    {
+                        "prompt_build_wall_ms": prompt_build_seconds * 1000,
+                        "prefill_wall_ms": prefill_wall_ms,
+                        "ar_decode_wall_ms": ar_decode_wall_ms,
+                        "semantic_wall_ms": semantic_wall_ms,
+                        "semantic_frames": float(semantic_frames),
+                        "batch_wall_ms": batch_seconds * 1000,
+                    }
+                    | {
+                        key: value
+                        for key, value in {
+                            "prefill_accelerator_ms": prefill_accelerator_ms,
+                            "ar_decode_accelerator_ms": ar_decode_accelerator_ms,
+                            "semantic_accelerator_ms": semantic_accelerator_ms,
+                        }.items()
+                        if value is not None
+                    }
+                ),
             )
 
             # Cleanup

@@ -29,6 +29,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         decoder_model: DAC,
         precision: torch.dtype,
         compile: bool,
+        perf_detail: bool = False,
+        perf_sample_frames: int = 16,
     ) -> None:
         super().__init__()
 
@@ -36,6 +38,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
+        self.perf_detail = perf_detail
+        self.perf_sample_frames = perf_sample_frames
 
     @torch.inference_mode()
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
@@ -265,6 +269,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             repetition_penalty=req.repetition_penalty,
             temperature=req.temperature,
             compile=self.compile,
+            perf_detail=getattr(self, "perf_detail", False),
+            perf_sample_frames=getattr(self, "perf_sample_frames", 16),
             iterative_prompt=req.iterative_prompt,
             chunk_length=req.chunk_length,
             prompt_tokens=prompt_tokens,

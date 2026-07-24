@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -56,6 +57,63 @@ class ServerShutdownControllerTest(unittest.TestCase):
         self.assertEqual(callbacks, ["shutdown"])
         self.assertFalse(controller.execute_shutdown())
         self.assertFalse(controller.request_shutdown("admin_request"))
+
+
+class ServiceSettingsEnvironmentTest(unittest.TestCase):
+    def test_project_debug_switch_enables_sampled_perf_detail(self) -> None:
+        with (
+            patch.dict(
+                "tools.fastapi_service.os.environ",
+                {
+                    "FISH_TTS_DEBUG": "true",
+                    "FISH_TTS_PERF_SAMPLE_FRAMES": "8",
+                },
+                clear=True,
+            ),
+            patch("tools.fastapi_service.load_project_env"),
+            patch(
+                "tools.fastapi_service.checkpoint_path",
+                return_value=Path("/tmp/llama"),
+            ),
+            patch(
+                "tools.fastapi_service.decoder_checkpoint_path",
+                return_value=Path("/tmp/codec.pth"),
+            ),
+            patch(
+                "tools.fastapi_service.default_device",
+                return_value="mps",
+            ),
+        ):
+            settings = ServiceSettings.from_env()
+
+        self.assertTrue(settings.perf_detail)
+        self.assertEqual(settings.perf_sample_frames, 8)
+        self.assertFalse(settings.mps_profile)
+
+    def test_generic_debug_variable_is_intentionally_ignored(self) -> None:
+        with (
+            patch.dict(
+                "tools.fastapi_service.os.environ",
+                {"DEBUG": "true"},
+                clear=True,
+            ),
+            patch("tools.fastapi_service.load_project_env"),
+            patch(
+                "tools.fastapi_service.checkpoint_path",
+                return_value=Path("/tmp/llama"),
+            ),
+            patch(
+                "tools.fastapi_service.decoder_checkpoint_path",
+                return_value=Path("/tmp/codec.pth"),
+            ),
+            patch(
+                "tools.fastapi_service.default_device",
+                return_value="mps",
+            ),
+        ):
+            settings = ServiceSettings.from_env()
+
+        self.assertFalse(settings.perf_detail)
 
 
 class FastAPIShutdownEndpointTest(unittest.TestCase):

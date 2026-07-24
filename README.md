@@ -120,6 +120,30 @@ signposts for Instruments:
 fish-tts-server ... --device mps --mps-profile
 ```
 
+To diagnose semantic generation itself, run a separate benchmark server with
+sampled stage timing:
+
+```bash
+fish-tts-server ... --device mps --perf-detail --perf-sample-frames 16
+```
+
+The equivalent project-scoped debug environment switch is:
+
+```bash
+FISH_TTS_DEBUG=true fish-tts-server ... --device mps
+```
+
+Use `FISH_TTS_PERF_SAMPLE_FRAMES=16` to change its sample limit. A bare
+`DEBUG=true` is intentionally ignored so unrelated frameworks or IDE launch
+settings cannot accidentally enable synchronized inference diagnostics.
+
+`--perf-detail` synchronizes only selected semantic frames and reports
+`slow_transformer`, `output_projection`, `slow_ar+output`, `main_sampler`, and
+`fast_ar+residual_sampler`. It is diagnostic-only and changes the sampled
+request's timing, so do not use that request's end-to-end RTF as a production
+benchmark. Run `--mps-profile` separately, without `--perf-detail`, when
+collecting an Instruments trace of GPU activity, occupancy, and bandwidth.
+
 Before starting another memory-intensive local job, gracefully stop the server
 and wait until port `8002` is no longer responding:
 

@@ -44,6 +44,10 @@ def main() -> None:
         settings = replace(settings, compile=True)
     if args.mps_profile:
         settings = replace(settings, mps_profile=True)
+    if args.perf_detail:
+        settings = replace(settings, perf_detail=True)
+    if args.perf_sample_frames:
+        settings = replace(settings, perf_sample_frames=args.perf_sample_frames)
 
     app = create_app(settings=settings)
     config = uvicorn.Config(
