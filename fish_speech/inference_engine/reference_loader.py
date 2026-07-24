@@ -1,5 +1,6 @@
 import io
 import re
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Literal, Tuple
@@ -20,6 +21,14 @@ from fish_speech.utils.schema import ServeReferenceAudio
 _ID_PATTERN = re.compile(r"^[a-zA-Z0-9\-_ ]+$")
 
 
+@dataclass(frozen=True)
+class ReferenceCacheStats:
+    enabled: bool
+    hits: int = 0
+    misses: int = 0
+    bypassed: int = 0
+
+
 class ReferenceLoader:
     def __init__(self) -> None:
         """
@@ -28,6 +37,7 @@ class ReferenceLoader:
         """
         self.ref_by_id: dict = {}
         self.ref_by_hash: dict = {}
+        self.last_reference_cache_stats = ReferenceCacheStats(enabled=False)
 
         # Make Pylance happy (attribut/method not defined...)
         self.decoder_model: DAC
@@ -73,14 +83,31 @@ class ReferenceLoader:
             ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
         )
 
-        if use_cache == "off" or id not in self.ref_by_id:
-            # If the references are not already loaded, encode them
+        cache_enabled = use_cache == "on"
+        if not cache_enabled:
             prompt_tokens = [
                 self.encode_reference(
-                    # decoder_model=self.decoder_model,
+                    reference_audio=audio_to_bytes(str(ref_audio)),
+                    enable_reference_audio=True,
+                ).detach().cpu()
+                for ref_audio in ref_audios
+            ]
+            prompt_texts = [
+                read_ref_text(str(ref_audio.with_suffix(".lab")))
+                for ref_audio in ref_audios
+            ]
+            self.last_reference_cache_stats = ReferenceCacheStats(
+                enabled=False,
+                bypassed=len(prompt_tokens),
+            )
+        elif id not in self.ref_by_id:
+            prompt_tokens = [
+                self.encode_reference(
                     reference_audio=audio_to_bytes(str(ref_audio)),
                     enable_reference_audio=True,
                 )
+                .detach()
+                .cpu()
                 for ref_audio in ref_audios
             ]
             prompt_texts = [
@@ -88,11 +115,18 @@ class ReferenceLoader:
                 for ref_audio in ref_audios
             ]
             self.ref_by_id[id] = (prompt_tokens, prompt_texts)
-
+            self.last_reference_cache_stats = ReferenceCacheStats(
+                enabled=True,
+                misses=len(prompt_tokens),
+            )
         else:
-            # Reuse already encoded references
-            logger.info("Use same references")
             prompt_tokens, prompt_texts = self.ref_by_id[id]
+            self.last_reference_cache_stats = ReferenceCacheStats(
+                enabled=True,
+                hits=len(prompt_tokens),
+            )
+
+        self._log_reference_cache_stats()
 
         return prompt_tokens, prompt_texts
 
@@ -104,31 +138,57 @@ class ReferenceLoader:
         # Load the references audio and text by hash
         audio_hashes = [sha256(ref.audio).hexdigest() for ref in references]
 
-        cache_used = False
+        cache_enabled = use_cache == "on"
+        hits = 0
+        misses = 0
+        bypassed = 0
         prompt_tokens, prompt_texts = [], []
         for i, ref in enumerate(references):
-            if use_cache == "off" or audio_hashes[i] not in self.ref_by_hash:
-                # If the references are not already loaded, encode them
-                prompt_tokens.append(
-                    self.encode_reference(
-                        reference_audio=ref.audio,
-                        enable_reference_audio=True,
-                    )
-                )
-                prompt_texts.append(ref.text)
-                self.ref_by_hash[audio_hashes[i]] = (prompt_tokens[-1], ref.text)
-
+            audio_hash = audio_hashes[i]
+            if not cache_enabled:
+                token = self.encode_reference(
+                    reference_audio=ref.audio,
+                    enable_reference_audio=True,
+                ).detach().cpu()
+                bypassed += 1
+            elif audio_hash not in self.ref_by_hash:
+                token = self.encode_reference(
+                    reference_audio=ref.audio,
+                    enable_reference_audio=True,
+                ).detach().cpu()
+                self.ref_by_hash[audio_hash] = token
+                misses += 1
             else:
-                # Reuse already encoded references
-                cached_token, cached_text = self.ref_by_hash[audio_hashes[i]]
-                prompt_tokens.append(cached_token)
-                prompt_texts.append(cached_text)
-                cache_used = True
+                token = self.ref_by_hash[audio_hash]
+                hits += 1
 
-        if cache_used:
-            logger.info("Use same references")
+            prompt_tokens.append(token)
+            # Text is request data, not an audio-derived cache value. Reusing
+            # cached text would make a corrected transcript silently ineffective.
+            prompt_texts.append(ref.text)
+
+        self.last_reference_cache_stats = ReferenceCacheStats(
+            enabled=cache_enabled,
+            hits=hits,
+            misses=misses,
+            bypassed=bypassed,
+        )
+        self._log_reference_cache_stats()
 
         return prompt_tokens, prompt_texts
+
+    def _log_reference_cache_stats(self) -> None:
+        stats = self.last_reference_cache_stats
+        logger.info(
+            "Reference cache: enabled={}, hits={}, misses={}, bypassed={}, "
+            "id_entries={}, audio_entries={}",
+            stats.enabled,
+            stats.hits,
+            stats.misses,
+            stats.bypassed,
+            len(self.ref_by_id),
+            len(self.ref_by_hash),
+        )
 
     def load_audio(self, reference_audio: bytes | str, sr: int):
         """

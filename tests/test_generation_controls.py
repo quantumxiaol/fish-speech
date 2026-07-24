@@ -8,6 +8,7 @@ from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.models.text2semantic.inference import (
     RAS_WIN_SIZE,
     decode_n_tokens,
+    ensure_model_caches,
     logits_to_probs,
     prepare_text_batches,
 )
@@ -17,6 +18,24 @@ from tools.fish_client import _collect_generation_kwargs, build_parser
 
 
 class RepetitionPenaltyTest(unittest.TestCase):
+    def test_model_cache_storage_is_initialized_once(self) -> None:
+        class FakeModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(1))
+                self.config = SimpleNamespace(max_seq_len=4096)
+                self.setup_calls = 0
+
+            def setup_caches(self, **_kwargs) -> None:
+                self.setup_calls += 1
+
+        model = FakeModel()
+        ensure_model_caches(model, device="cpu")
+        ensure_model_caches(model, device="cpu")
+
+        self.assertEqual(model.setup_calls, 1)
+        self.assertTrue(model._cache_setup_done)
+
     def test_repetition_penalty_changes_seen_token_scores(self) -> None:
         logits = torch.tensor([2.0, -2.0, 1.0])
         original = logits.clone()

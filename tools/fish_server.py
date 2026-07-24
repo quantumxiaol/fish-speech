@@ -42,6 +42,8 @@ def main() -> None:
         settings = replace(settings, dtype=args.dtype)
     if args.compile:
         settings = replace(settings, compile=True)
+    if args.mps_profile:
+        settings = replace(settings, mps_profile=True)
 
     app = create_app(settings=settings)
     config = uvicorn.Config(

@@ -64,6 +64,7 @@ class InferenceEngineMemoryTest(unittest.TestCase):
             patch(
                 "fish_speech.inference_engine.empty_mps_cache", return_value=stats
             ) as empty_cache,
+            patch("fish_speech.inference_engine.log_device_memory"),
         ):
             results = list(engine.inference(ServeTTSRequest(text="test")))
 
@@ -91,8 +92,12 @@ class InferenceEngineMemoryTest(unittest.TestCase):
             patch(
                 "fish_speech.inference_engine.torch.cuda.empty_cache"
             ) as cuda_empty_cache,
+            patch(
+                "fish_speech.inference_engine.torch.cuda.reset_peak_memory_stats"
+            ),
             patch("fish_speech.inference_engine.gc.collect") as collect,
             patch("fish_speech.inference_engine.empty_mps_cache") as mps_empty_cache,
+            patch("fish_speech.inference_engine.log_device_memory"),
         ):
             results = list(engine.inference(ServeTTSRequest(text="test")))
 

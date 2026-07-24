@@ -5,7 +5,7 @@ import threading
 import time
 import traceback
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Optional, Tuple, Union
 
@@ -22,6 +22,11 @@ from fish_speech.content_sequence import (
     VQPart,
 )
 from fish_speech.conversation import Conversation, Message
+from fish_speech.device_memory import (
+    AcceleratorTimer,
+    get_cuda_memory_snapshot,
+    get_mps_memory_snapshot,
+)
 from fish_speech.env_config import checkpoint_path, default_device
 from fish_speech.tokenizer import IM_END_TOKEN
 
@@ -51,6 +56,40 @@ def multinomial_sample_one_no_sync(probs_sort):
 RAS_WIN_SIZE = 10  # window for Repetition Aware Sampling
 RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
+
+
+def log_device_memory(label: str, device: str | torch.device) -> None:
+    gib = 1024**3
+    mps = get_mps_memory_snapshot(device)
+    if mps is not None:
+        logger.info(
+            "MPS memory {}: tensors={:.2f} GiB, driver={:.2f} GiB, "
+            "non_tensor_driver={:.2f} GiB, recommended={:.2f} GiB, "
+            "driver/recommended={:.1%}",
+            label,
+            mps.current / gib,
+            mps.driver / gib,
+            mps.cache_and_driver_overhead / gib,
+            mps.recommended / gib,
+            mps.driver_ratio,
+        )
+        return
+
+    cuda = get_cuda_memory_snapshot(device)
+    if cuda is not None:
+        logger.info(
+            "CUDA memory {}: allocated={:.2f} GiB, reserved={:.2f} GiB, "
+            "reserved_not_allocated={:.2f} GiB, peak_allocated={:.2f} GiB, "
+            "peak_reserved={:.2f} GiB, free={:.2f}/{:.2f} GiB",
+            label,
+            cuda.allocated / gib,
+            cuda.reserved / gib,
+            cuda.reserved_not_allocated / gib,
+            cuda.peak_allocated / gib,
+            cuda.peak_reserved / gib,
+            cuda.free / gib,
+            cuda.total / gib,
+        )
 
 
 def logits_to_probs(
@@ -251,7 +290,15 @@ def decode_n_tokens(
     # [MODIFIED] Pre-fetch ID for efficiency loop
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
 
-    for i in tqdm(range(num_new_tokens)):
+    progress = tqdm(
+        range(num_new_tokens),
+        desc=f"AR decode (max {num_new_tokens}, stops at EOS)",
+        unit="tok",
+        # The true output length is unknown until EOS. Do not display a
+        # percentage or ETA against max_new_tokens as if it were the target.
+        bar_format="{desc}: {n_fmt} tokens [{elapsed}, {rate_fmt}]",
+    )
+    for i in progress:
         with sdpa_kernel(SDPBackend.MATH):
             next_token = decode_one_token(
                 model=model,
@@ -278,9 +325,27 @@ def decode_n_tokens(
         if cur_token[0, 0, -1] == im_end_id:
             break
 
+    progress.close()
     del cur_token
 
     return torch.cat(new_tokens, dim=1)
+
+
+def ensure_model_caches(
+    model: DualARTransformer,
+    *,
+    device: str | torch.device,
+) -> None:
+    if getattr(model, "_cache_setup_done", False):
+        return
+
+    with torch.device(device):
+        model.setup_caches(
+            max_batch_size=1,
+            max_seq_len=model.config.max_seq_len,
+            dtype=next(model.parameters()).dtype,
+        )
+    model._cache_setup_done = True
 
 
 @torch.no_grad()
@@ -294,6 +359,7 @@ def generate(
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
     num_samples: int = 1,
+    metrics: Optional[dict[str, float]] = None,
     **sampling_kwargs,
 ):
     """
@@ -323,15 +389,7 @@ def generate(
         model.parameters()
     ).dtype  # model weight dtype (bfloat16), NOT prompt dtype (int32)
 
-    # Critical fix: Only set up cache on first run or when necessary
-    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,  # Fixed to 1, avoid dynamic changes
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
-            )
-        model._cache_setup_done = True
+    ensure_model_caches(model, device=device)
 
     codebook_dim = 1 + model.config.num_codebooks
 
@@ -370,6 +428,11 @@ def generate(
 
     prefill_decode = decode_one_token_ar
 
+    semantic_timer = AcceleratorTimer(device)
+    prefill_timer = AcceleratorTimer(device)
+    ar_decode_timer = AcceleratorTimer(device)
+    semantic_timer.start()
+    prefill_timer.start()
     first_token = prefill_decode(
         model,
         prompt.view(1, codebook_dim, -1),
@@ -382,11 +445,13 @@ def generate(
         audio_masks,
         audio_parts,
     )
+    prefill_timer.stop()
     seq[:, T : T + 1] = first_token
 
     # Recreate input_pos
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
+    ar_decode_timer.start()
     x = decode_n_tokens(
         model,
         first_token.view(1, codebook_dim, -1),
@@ -401,6 +466,24 @@ def generate(
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
     )
+    ar_decode_timer.stop()
+    semantic_timer.stop()
+    # One wait at the end of the whole semantic phase keeps default metrics
+    # accurate without forcing a CPU/GPU handshake between prefill and AR.
+    semantic_timer.synchronize()
+    if metrics is not None:
+        metrics["prefill_wall_ms"] = prefill_timer.wall_elapsed_ms()
+        metrics["ar_decode_wall_ms"] = ar_decode_timer.wall_elapsed_ms()
+        metrics["semantic_wall_ms"] = semantic_timer.wall_elapsed_ms()
+        prefill_accelerator_ms = prefill_timer.accelerator_elapsed_ms()
+        ar_decode_accelerator_ms = ar_decode_timer.accelerator_elapsed_ms()
+        semantic_accelerator_ms = semantic_timer.accelerator_elapsed_ms()
+        if prefill_accelerator_ms is not None:
+            metrics["prefill_accelerator_ms"] = prefill_accelerator_ms
+        if ar_decode_accelerator_ms is not None:
+            metrics["ar_decode_accelerator_ms"] = ar_decode_accelerator_ms
+        if semantic_accelerator_ms is not None:
+            metrics["semantic_accelerator_ms"] = semantic_accelerator_ms
     seq = seq[:, : T + 1 + x.size(1)]
     seq[:, T + 1 :] = x
 
@@ -502,6 +585,7 @@ class GenerateResponse:
     action: Literal["sample", "next"]
     codes: Optional[torch.Tensor] = None
     text: Optional[str] = None
+    metrics: Optional[dict[str, float]] = None
 
 
 def split_text_by_speaker(text: str) -> list[str]:
@@ -672,7 +756,6 @@ def generate_long(
     if prompt_tokens:
         prompt_tokens = [i.cpu() for i in prompt_tokens]
 
-    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
     max_length = model.config.max_seq_len
 
@@ -727,20 +810,19 @@ def generate_long(
     )
 
     for sample_idx in range(num_samples):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        t0 = time.perf_counter()
-
         # Deep copy base conversation for this sample
         conversation = deepcopy(base_conversation)
 
         for batch_idx, batch_text in enumerate(batches):
+            batch_start = time.perf_counter()
+            log_device_memory(f"before batch {batch_idx}", device)
             logger.info(
                 f"--- Sample {sample_idx}, Batch {batch_idx} "
                 f"({len(batch_text.encode('utf-8'))} bytes) ---"
             )
             logger.info(f"Batch text: {batch_text}")
+
+            prompt_build_start = time.perf_counter()
 
             # Add user message
             conversation.append(
@@ -792,7 +874,9 @@ def generate_long(
 
             encoded = encoded.to(device=device)
             prompt_length = encoded.size(1)
+            prompt_build_seconds = time.perf_counter() - prompt_build_start
 
+            generation_metrics: dict[str, float] = {}
             y = generate(
                 model=model,
                 prompt=encoded,
@@ -804,28 +888,78 @@ def generate_long(
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
+                metrics=generation_metrics,
             )
 
             if sample_idx == 0 and batch_idx == 0 and compile:
-                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+                logger.info(
+                    "First compiled batch wall time: {:.2f} seconds",
+                    time.perf_counter() - batch_start,
+                )
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-            t_batch = time.perf_counter() - t0
+            batch_seconds = time.perf_counter() - batch_start
             tokens_generated = y.size(1) - prompt_length
-            tokens_sec = tokens_generated / t_batch if t_batch > 0 else 0
-            logger.info(
-                f"Batch {batch_idx}: Generated {tokens_generated} tokens in "
-                f"{t_batch:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-            )
-            logger.info(
-                f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
-            )
 
             # Extract generated codes
             codes = y[1:, prompt_length:-1].clone()
             assert (codes >= 0).all(), f"Negative code found: {codes}"
+            semantic_frames = codes.size(1)
+            prefill_wall_ms = generation_metrics.get("prefill_wall_ms", 0.0)
+            ar_decode_wall_ms = generation_metrics.get("ar_decode_wall_ms", 0.0)
+            prefill_accelerator_ms = generation_metrics.get(
+                "prefill_accelerator_ms"
+            )
+            ar_decode_accelerator_ms = generation_metrics.get(
+                "ar_decode_accelerator_ms"
+            )
+            semantic_accelerator_ms = generation_metrics.get(
+                "semantic_accelerator_ms"
+            )
+            semantic_wall_ms = generation_metrics.get("semantic_wall_ms", 0.0)
+            semantic_seconds = semantic_wall_ms / 1000
+            frames_per_second = (
+                semantic_frames / semantic_seconds if semantic_seconds > 0 else 0.0
+            )
+            frame_ms = (
+                semantic_wall_ms / semantic_frames if semantic_frames > 0 else 0.0
+            )
+            logger.info(
+                "Batch {} metrics: prompt_tokens={}, generated_tokens={}, "
+                "semantic_frames={}, prompt_build_wall={:.3f}ms, "
+                "prefill_first_frame_wall={:.3f}ms, "
+                "ar_decode_wall={:.3f}ms, semantic_wall={:.3f}ms, "
+                "prefill_accelerator={}, ar_decode_accelerator={}, "
+                "semantic_accelerator={}, "
+                "semantic_frame={:.3f}ms, semantic_frames/s={:.2f}, "
+                "batch_wall={:.3f}ms",
+                batch_idx,
+                prompt_length,
+                tokens_generated,
+                semantic_frames,
+                prompt_build_seconds * 1000,
+                prefill_wall_ms,
+                ar_decode_wall_ms,
+                semantic_wall_ms,
+                (
+                    f"{prefill_accelerator_ms:.3f}ms"
+                    if prefill_accelerator_ms is not None
+                    else "n/a"
+                ),
+                (
+                    f"{ar_decode_accelerator_ms:.3f}ms"
+                    if ar_decode_accelerator_ms is not None
+                    else "n/a"
+                ),
+                (
+                    f"{semantic_accelerator_ms:.3f}ms"
+                    if semantic_accelerator_ms is not None
+                    else "n/a"
+                ),
+                frame_ms,
+                frames_per_second,
+                batch_seconds * 1000,
+            )
+            log_device_memory(f"after batch {batch_idx}", device)
 
             # Add assistant message with generated codes back to conversation
             conversation.append(
@@ -839,12 +973,32 @@ def generate_long(
                 )
             )
 
-            yield GenerateResponse(action="sample", codes=codes, text=batch_text)
+            yield GenerateResponse(
+                action="sample",
+                codes=codes,
+                text=batch_text,
+                metrics=({
+                    "prompt_build_wall_ms": prompt_build_seconds * 1000,
+                    "prefill_wall_ms": prefill_wall_ms,
+                    "ar_decode_wall_ms": ar_decode_wall_ms,
+                    "semantic_wall_ms": semantic_wall_ms,
+                    "semantic_frames": float(semantic_frames),
+                    "batch_wall_ms": batch_seconds * 1000,
+                } | {
+                    key: value
+                    for key, value in {
+                        "prefill_accelerator_ms": prefill_accelerator_ms,
+                        "ar_decode_accelerator_ms": ar_decode_accelerator_ms,
+                        "semantic_accelerator_ms": semantic_accelerator_ms,
+                    }.items()
+                    if value is not None
+                }),
+            )
 
             # Cleanup
             del y, encoded
 
-        if torch.cuda.is_available():
+        if torch.device(device).type == "cuda":
             logger.info(
                 f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
             )
@@ -862,6 +1016,7 @@ class WrappedGenerateResponse:
 class GenerateRequest:
     request: dict
     response_queue: queue.Queue
+    enqueued_at: float = field(default_factory=time.perf_counter)
 
 
 def launch_thread_safe_queue(
@@ -882,12 +1037,7 @@ def launch_thread_safe_queue(
             compile=compile,
             max_seq_len=max_seq_len,
         )
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
-            )
+        ensure_model_caches(model, device=device)
         init_event.set()
 
         while True:
@@ -897,24 +1047,29 @@ def launch_thread_safe_queue(
 
             kwargs = item.request
             response_queue = item.response_queue
+            queue_wait_ms = (time.perf_counter() - item.enqueued_at) * 1000
+            queue_wait_reported = False
 
             try:
                 for chunk in generate_long(
                     model=model, decode_one_token=decode_one_token, **kwargs
                 ):
+                    if chunk.metrics is not None and not queue_wait_reported:
+                        chunk.metrics["llama_queue_wait_ms"] = queue_wait_ms
+                        queue_wait_reported = True
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=chunk)
                     )
 
                 # Only clear cache after complete request batch
-                if torch.cuda.is_available():
+                if torch.device(device).type == "cuda":
                     torch.cuda.empty_cache()
 
             except Exception as e:
                 logger.error(traceback.format_exc())
                 response_queue.put(WrappedGenerateResponse(status="error", response=e))
                 # Clear cache on error
-                if torch.cuda.is_available():
+                if torch.device(device).type == "cuda":
                     torch.cuda.empty_cache()
 
     threading.Thread(target=worker, daemon=True).start()

@@ -102,6 +102,24 @@ synthesize the request as one batch. The equivalent FastAPI form field is
 `iterative_prompt=true|false`; `/v1/tts` accepts the same field in
 `ServeTTSRequest`.
 
+For repeated requests with the same reference audio, add
+`--use-memory-cache on`. The cache is keyed by the reference audio bytes,
+stores only the encoded VQ tokens on CPU, and lasts until the server exits.
+Single voice-clone requests default to `off`; batch-file requests default to
+`on`.
+
+Inference logs report phase wall timings, CUDA accelerator-event timings,
+semantic frame latency/rate, end-to-end RTF, and MPS or CUDA allocator memory.
+MPS metrics deliberately avoid event elapsed-time reads because they can block
+indefinitely in the threaded worker on PyTorch 2.8; default MPS metrics add no
+frame-level synchronization. Actual Metal timing, bandwidth, and GPU occupancy
+require a Metal trace; start the server with `--mps-profile` to emit PyTorch MPS
+signposts for Instruments:
+
+```bash
+fish-tts-server ... --device mps --mps-profile
+```
+
 Before starting another memory-intensive local job, gracefully stop the server
 and wait until port `8002` is no longer responding:
 

@@ -7,6 +7,7 @@ import platform
 import tempfile
 import threading
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Callable, Optional
@@ -53,6 +54,10 @@ from fish_speech.env_config import (  # noqa: E402
     decoder_checkpoint_path,
     default_device,
     load_project_env,
+)
+from fish_speech.device_memory import (  # noqa: E402
+    get_cuda_memory_snapshot,
+    get_mps_memory_snapshot,
 )
 from fish_speech.inference_engine import TTSInferenceEngine  # noqa: E402
 from fish_speech.models.dac.inference import load_model as load_decoder_model  # noqa: E402
@@ -187,6 +192,7 @@ class ServiceSettings:
     dtype: Optional[str]
     compile: bool
     max_seq_len: Optional[int]
+    mps_profile: bool = False
 
     @classmethod
     def from_env(cls) -> "ServiceSettings":
@@ -206,6 +212,8 @@ class ServiceSettings:
             dtype=os.getenv("FISH_TTS_DTYPE") or None,
             compile=os.getenv("FISH_TTS_COMPILE", "").lower() in {"1", "true", "yes"},
             max_seq_len=_optional_int(os.getenv("FISH_TTS_MAX_SEQ_LEN", "4096")),
+            mps_profile=os.getenv("FISH_TTS_MPS_PROFILE", "").lower()
+            in {"1", "true", "yes"},
         )
 
 
@@ -247,6 +255,17 @@ class HealthResponse(BaseModel):
     llama_checkpoint_path: str
     decoder_checkpoint_path: str
     shutdown_pending: bool
+    mps_profile: bool
+    mps_tensor_gib: Optional[float]
+    mps_driver_gib: Optional[float]
+    mps_recommended_gib: Optional[float]
+    mps_driver_percent: Optional[float]
+    cuda_allocated_gib: Optional[float]
+    cuda_reserved_gib: Optional[float]
+    cuda_peak_allocated_gib: Optional[float]
+    cuda_peak_reserved_gib: Optional[float]
+    cuda_free_gib: Optional[float]
+    cuda_total_gib: Optional[float]
 
 
 class ShutdownResponse(BaseModel):
@@ -370,13 +389,25 @@ class ModelManager:
 
     def infer(self, request: ServeTTSRequest) -> tuple[int, np.ndarray]:
         engine = self.get_engine()
+        profile_context = nullcontext()
+        if self.settings.mps_profile and self.device == "mps":
+            logger.info(
+                "MPS signpost profiling enabled for this request "
+                "(mode=interval,event)"
+            )
+            profile_context = torch.mps.profiler.profile(
+                mode="interval,event",
+                wait_until_completed=False,
+            )
+
         with self._inference_lock:
-            for result in engine.inference(request):
-                if result.code == "error":
-                    raise RuntimeError(str(result.error))
-                if result.code == "final" and isinstance(result.audio, tuple):
-                    sample_rate, audio = result.audio
-                    return int(sample_rate), audio
+            with profile_context:
+                for result in engine.inference(request):
+                    if result.code == "error":
+                        raise RuntimeError(str(result.error))
+                    if result.code == "final" and isinstance(result.audio, tuple):
+                        sample_rate, audio = result.audio
+                        return int(sample_rate), audio
         raise RuntimeError("No audio generated, please check the input text.")
 
 
@@ -612,6 +643,9 @@ def create_app(
 
     @app.get(f"{API_PREFIX}/health", response_model=HealthResponse)
     def health() -> HealthResponse:
+        mps_memory = get_mps_memory_snapshot(manager.device)
+        cuda_memory = get_cuda_memory_snapshot(manager.device)
+        gib = 1024**3
         return HealthResponse(
             status="ok",
             storage_root=str(store.root),
@@ -622,6 +656,43 @@ def create_app(
             llama_checkpoint_path=str(app_settings.llama_checkpoint_path),
             decoder_checkpoint_path=str(app_settings.decoder_checkpoint_path),
             shutdown_pending=shutdown_controller.shutdown_pending,
+            mps_profile=app_settings.mps_profile,
+            mps_tensor_gib=(
+                mps_memory.current / gib if mps_memory is not None else None
+            ),
+            mps_driver_gib=(
+                mps_memory.driver / gib if mps_memory is not None else None
+            ),
+            mps_recommended_gib=(
+                mps_memory.recommended / gib if mps_memory is not None else None
+            ),
+            mps_driver_percent=(
+                mps_memory.driver_ratio * 100
+                if mps_memory is not None
+                else None
+            ),
+            cuda_allocated_gib=(
+                cuda_memory.allocated / gib if cuda_memory is not None else None
+            ),
+            cuda_reserved_gib=(
+                cuda_memory.reserved / gib if cuda_memory is not None else None
+            ),
+            cuda_peak_allocated_gib=(
+                cuda_memory.peak_allocated / gib
+                if cuda_memory is not None
+                else None
+            ),
+            cuda_peak_reserved_gib=(
+                cuda_memory.peak_reserved / gib
+                if cuda_memory is not None
+                else None
+            ),
+            cuda_free_gib=(
+                cuda_memory.free / gib if cuda_memory is not None else None
+            ),
+            cuda_total_gib=(
+                cuda_memory.total / gib if cuda_memory is not None else None
+            ),
         )
 
     @app.post(
@@ -837,4 +908,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
     )
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--mps-profile",
+        action="store_true",
+        help="Emit MPS OS signposts for Instruments Metal System Trace.",
+    )
     return parser

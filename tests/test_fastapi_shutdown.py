@@ -82,6 +82,20 @@ class FastAPIShutdownEndpointTest(unittest.TestCase):
             self.assertEqual(second.json()["status"], "already_pending")
             self.assertEqual(callbacks, ["shutdown"])
 
+    def test_health_metrics_fall_back_cleanly_when_accelerator_is_unavailable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._make_app(Path(tmp), [])
+            with TestClient(app, client=("127.0.0.1", 50000)) as client:
+                response = client.get("/fishspeech/health")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["mps_profile"])
+        self.assertIsNone(payload["mps_tensor_gib"])
+        self.assertIsNone(payload["cuda_allocated_gib"])
+
     def test_ipv6_loopback_and_ipv4_mapped_loopback_are_accepted(self) -> None:
         headers = {ADMIN_SHUTDOWN_HEADER: ADMIN_SHUTDOWN_VALUE}
         for host in ("::1", "::ffff:127.0.0.1"):
