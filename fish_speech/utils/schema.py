@@ -78,6 +78,7 @@ class ServeTTSRequest(BaseModel):
     chunk_length: Annotated[int, conint(ge=100, le=1000, strict=True)] = 200
     # Drama 3 only: generate the whole text in one pass instead of ~300-byte chunks.
     single_chunk: bool = False
+    iterative_prompt: bool = True
     # Audio format
     format: Literal["wav", "pcm", "mp3", "opus"] = "wav"
     # Latency mode (used by api.fish.audio; "normal" or "balanced")

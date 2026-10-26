@@ -7,9 +7,9 @@ import time
 import traceback
 from collections.abc import Iterator
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, Optional, Tuple
 
 import click
 import numpy as np
@@ -22,6 +22,7 @@ from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 from tqdm import tqdm
 
 from fish_speech.content_sequence import (
+    BasePart,
     TextPart,
     VQPart,
 )
@@ -53,6 +54,13 @@ from fish_speech.models.text2semantic.sampling import (
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
 )
+from fish_speech.device_memory import (
+    AcceleratorTimer,
+    get_cuda_memory_snapshot,
+    get_mps_memory_snapshot,
+    synchronize_device,
+)
+from fish_speech.env_config import checkpoint_path, default_device
 from fish_speech.tokenizer import IM_END_TOKEN
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -83,12 +91,133 @@ RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
 
 
+@dataclass(frozen=True)
+class PerfDetailSample:
+    frame_index: int
+    slow_transformer_ms: float
+    output_projection_ms: float
+    slow_ar_and_output_ms: float
+    main_sampler_ms: float
+    fast_ar_and_sampler_ms: float
+    total_ms: float
+
+
+def should_sample_perf_detail(
+    frame_index: int,
+    samples_collected: int,
+    max_samples: int,
+) -> bool:
+    """Sample early frames densely and later context every 16 frames."""
+    if max_samples <= 0 or samples_collected >= max_samples:
+        return False
+    return frame_index < 4 or (frame_index >= 16 and frame_index % 16 == 0)
+
+
+def summarize_perf_detail(
+    samples: list[PerfDetailSample],
+) -> dict[str, float]:
+    if not samples:
+        return {}
+
+    def mean(attribute: str) -> float:
+        return sum(getattr(sample, attribute) for sample in samples) / len(samples)
+
+    first_count = min(4, len(samples))
+    last_count = min(4, len(samples))
+    first_total = sum(sample.total_ms for sample in samples[:first_count]) / first_count
+    last_total = sum(sample.total_ms for sample in samples[-last_count:]) / last_count
+    total_stage_ms = sum(sample.total_ms for sample in samples)
+    slow_transformer_ms = sum(sample.slow_transformer_ms for sample in samples)
+    output_projection_ms = sum(sample.output_projection_ms for sample in samples)
+    slow_stage_ms = sum(sample.slow_ar_and_output_ms for sample in samples)
+    sampler_stage_ms = sum(sample.main_sampler_ms for sample in samples)
+    fast_stage_ms = sum(sample.fast_ar_and_sampler_ms for sample in samples)
+
+    return {
+        "perf_detail_sample_count": float(len(samples)),
+        "perf_slow_transformer_mean_ms": mean("slow_transformer_ms"),
+        "perf_output_projection_mean_ms": mean("output_projection_ms"),
+        "perf_slow_ar_and_output_mean_ms": mean("slow_ar_and_output_ms"),
+        "perf_main_sampler_mean_ms": mean("main_sampler_ms"),
+        "perf_fast_ar_and_sampler_mean_ms": mean("fast_ar_and_sampler_ms"),
+        "perf_profiled_frame_mean_ms": mean("total_ms"),
+        "perf_slow_transformer_share": (
+            slow_transformer_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_output_projection_share": (
+            output_projection_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_slow_ar_and_output_share": (
+            slow_stage_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_main_sampler_share": (
+            sampler_stage_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_fast_ar_and_sampler_share": (
+            fast_stage_ms / total_stage_ms if total_stage_ms > 0 else 0.0
+        ),
+        "perf_first_frames_mean_ms": first_total,
+        "perf_last_frames_mean_ms": last_total,
+        "perf_context_latency_ratio": (
+            last_total / first_total if first_total > 0 else 0.0
+        ),
+    }
+
+
+def log_device_memory(label: str, device: str | torch.device) -> None:
+    gib = 1024**3
+    mps = get_mps_memory_snapshot(device)
+    if mps is not None:
+        logger.info(
+            "MPS memory {}: tensors={:.2f} GiB, driver={:.2f} GiB, "
+            "non_tensor_driver={:.2f} GiB, recommended={:.2f} GiB, "
+            "driver/recommended={:.1%}",
+            label,
+            mps.current / gib,
+            mps.driver / gib,
+            mps.cache_and_driver_overhead / gib,
+            mps.recommended / gib,
+            mps.driver_ratio,
+        )
+        return
+
+    cuda = get_cuda_memory_snapshot(device)
+    if cuda is not None:
+        logger.info(
+            "CUDA memory {}: allocated={:.2f} GiB, reserved={:.2f} GiB, "
+            "reserved_not_allocated={:.2f} GiB, peak_allocated={:.2f} GiB, "
+            "peak_reserved={:.2f} GiB, free={:.2f}/{:.2f} GiB",
+            label,
+            cuda.allocated / gib,
+            cuda.reserved / gib,
+            cuda.reserved_not_allocated / gib,
+            cuda.peak_allocated / gib,
+            cuda.peak_reserved / gib,
+            cuda.free / gib,
+            cuda.total / gib,
+        )
+
+
 def logits_to_probs(
     logits,
     temperature: torch.Tensor,
     top_p: torch.Tensor,
-    top_k: int,  # 注意: 我看到你传进来的是 int，这很关键
+    top_k: int,
+    repetition_penalty: torch.Tensor | float = 1.0,
+    previous_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if previous_tokens is not None:
+        previous_tokens = previous_tokens.long()
+        previous_scores = torch.gather(logits, dim=-1, index=previous_tokens)
+        penalized_scores = torch.where(
+            previous_scores < 0,
+            previous_scores * repetition_penalty,
+            previous_scores / repetition_penalty,
+        )
+        # Use the out-of-place form so normal and RAS fallback sampling both
+        # start from the same unmodified logits.
+        logits = logits.scatter(dim=-1, index=previous_tokens, src=penalized_scores)
+
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
 
@@ -114,12 +243,16 @@ def sample(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    repetition_penalty: torch.Tensor | float = 1.0,
+    previous_tokens: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     probs = logits_to_probs(
         logits=logits[0, -1],
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        previous_tokens=previous_tokens,
     )
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
@@ -135,25 +268,46 @@ def decode_one_token_ar(
     semantic_logit_bias: torch.Tensor,
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
-    previous_tokens: torch.Tensor | None = None,
-    kv_len: int | None = None,
+    previous_tokens: Optional[torch.Tensor] = None,
+    kv_len: Optional[int] = None,
+    perf_sample: Optional[dict[str, float]] = None,
+    repetition_penalty: torch.Tensor | float = 1.0,
 ) -> torch.Tensor:
+    if perf_sample is not None:
+        # Diagnostic mode only: isolate the three data-dependent stages with
+        # explicit boundaries. Normal inference never enters this branch.
+        synchronize_device(x.device)
+        frame_start = time.perf_counter()
+        stage_start = frame_start
+
     forward_result = model.forward_generate(
         x,
         input_pos,
         audio_masks=audio_masks,
         audio_parts=audio_parts,
         kv_len=kv_len,
+        perf_sample=perf_sample,
     )
     logits = forward_result.logits  # (1, 1, vocab_size)
     hidden_states = forward_result.hidden_states
+
+    if perf_sample is not None:
+        synchronize_device(x.device)
+        stage_end = time.perf_counter()
+        perf_sample["slow_ar_and_output_ms"] = (stage_end - stage_start) * 1000
+        stage_start = stage_end
 
     # Apply constrained decoding: only allow semantic tokens + im_end
     biased_logits = logits + semantic_logit_bias
 
     # Normal sample
     main_token_normal = sample(
-        biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
+        biased_logits,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        previous_tokens=previous_tokens[0] if previous_tokens is not None else None,
     )[0]
 
     # RAS: also sample with high temp to use as fallback if token repeats
@@ -162,7 +316,12 @@ def decode_one_token_ar(
     )
     high_top_p = torch.tensor(RAS_HIGH_TOP_P, device=top_p.device, dtype=top_p.dtype)
     main_token_high = sample(
-        biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
+        biased_logits,
+        temperature=high_temp,
+        top_p=high_top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        previous_tokens=previous_tokens[0] if previous_tokens is not None else None,
     )[0]
 
     # Use high-temp sample if: token is semantic AND token is in previous window
@@ -178,6 +337,12 @@ def decode_one_token_ar(
         )
 
     codebooks = [main_token_normal]
+
+    if perf_sample is not None:
+        synchronize_device(x.device)
+        stage_end = time.perf_counter()
+        perf_sample["main_sampler_ms"] = (stage_end - stage_start) * 1000
+        stage_start = stage_end
 
     input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
     model.forward_generate_fast(hidden_states, input_pos)
@@ -202,12 +367,24 @@ def decode_one_token_ar(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            previous_tokens=(
+                previous_tokens[codebook_idx + 1]
+                if previous_tokens is not None
+                else None
+            ),
         )[0]
 
         hidden_states = model.fast_embeddings(a)
         codebooks.append(a)
 
     codebooks = torch.stack(codebooks, dim=1)
+
+    if perf_sample is not None:
+        synchronize_device(x.device)
+        stage_end = time.perf_counter()
+        perf_sample["fast_ar_and_sampler_ms"] = (stage_end - stage_start) * 1000
+        perf_sample["total_ms"] = (stage_end - frame_start) * 1000
 
     # Only delete references, let Python GC handle cleanup
     del logits, hidden_states, forward_result
@@ -227,19 +404,28 @@ def decode_n_tokens(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
-    kv_start_pos: int | None = None,
+    kv_start_pos: Optional[int] = None,
+    perf_detail: bool = False,
+    perf_sample_frames: int = 16,
+    perf_samples: Optional[list[PerfDetailSample]] = None,
+    repetition_penalty: torch.Tensor | float = 1.0,
 ):
+    codebook_dim = model.config.num_codebooks + 1
+    if num_new_tokens <= 0:
+        return torch.empty(
+            (codebook_dim, 0), dtype=cur_token.dtype, device=cur_token.device
+        )
+
     if kv_start_pos is None:
-        # Compatibility fallback for direct callers. The production generation
-        # path passes the Python position explicitly to avoid a device sync.
+        # Compatibility fallback for direct callers. Production generation
+        # passes the Python position explicitly, avoiding a device sync here.
         kv_start_pos = int(input_pos[0].item())
 
-    # Rolling window for RAS (Repetition Aware Sampling)
-    previous_tokens = torch.zeros(
-        (model.config.num_codebooks + 1, RAS_WIN_SIZE),
-        dtype=torch.int,
-        device=cur_token.device,
-    )
+    # RAS and repetition penalty only need set membership, not chronological
+    # ordering. Seed the fixed-size ring with the prefill token so token 0 is
+    # not treated as fake history for fast codebooks.
+    first_token = cur_token.view(codebook_dim, -1)[:, -1]
+    previous_tokens = first_token[:, None].expand(-1, RAS_WIN_SIZE).clone()
     # Accumulate all generated tokens (the actual output)
     new_tokens = []
 
@@ -247,45 +433,79 @@ def decode_n_tokens(
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
 
     callback_parameters = inspect.signature(decode_one_token).parameters
-    supports_kv_len = "kv_len" in callback_parameters or any(
+    accepts_kwargs = any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in callback_parameters.values()
     )
+    progress = tqdm(
+        range(num_new_tokens),
+        desc=f"AR decode (max {num_new_tokens}, stops at EOS)",
+        unit="tok",
+        # The true output length is unknown until EOS. Do not display a
+        # percentage or ETA against max_new_tokens as if it were the target.
+        bar_format="{desc}: {n_fmt} tokens [{elapsed}, {rate_fmt}]",
+    )
+    for i in progress:
+        perf_sample = None
+        if perf_detail and should_sample_perf_detail(
+            frame_index=i,
+            samples_collected=len(perf_samples or []),
+            max_samples=perf_sample_frames,
+        ):
+            perf_sample = {}
 
-    for i in tqdm(range(num_new_tokens)):
-        decode_kwargs = {
-            "model": model,
-            "x": cur_token,
-            "input_pos": input_pos,
-            "previous_tokens": previous_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "semantic_logit_bias": semantic_logit_bias,
-            "audio_masks": audio_masks,
-            "audio_parts": audio_parts,
-        }
-        if supports_kv_len:
-            decode_kwargs["kv_len"] = kv_start_pos + i + 1
-
+        decode_kwargs = dict(
+            model=model,
+            x=cur_token,
+            input_pos=input_pos,
+            previous_tokens=previous_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            semantic_logit_bias=semantic_logit_bias,
+            audio_masks=audio_masks,
+            audio_parts=audio_parts,
+        )
+        for name, value in (
+            ("kv_len", kv_start_pos + i + 1),
+            ("repetition_penalty", repetition_penalty),
+        ):
+            if accepts_kwargs or name in callback_parameters:
+                decode_kwargs[name] = value
+        if perf_sample is not None:
+            if accepts_kwargs or "perf_sample" in callback_parameters:
+                decode_kwargs["perf_sample"] = perf_sample
+            else:
+                raise ValueError(
+                    "perf_detail requires a callback supporting perf_sample"
+                )
         with sdpa_kernel(SDPBackend.MATH):
             next_token = decode_one_token(**decode_kwargs).clone()
 
+        if perf_sample is not None and perf_samples is not None:
+            perf_samples.append(
+                PerfDetailSample(
+                    frame_index=i,
+                    slow_transformer_ms=perf_sample["slow_transformer_ms"],
+                    output_projection_ms=perf_sample["output_projection_ms"],
+                    slow_ar_and_output_ms=perf_sample["slow_ar_and_output_ms"],
+                    main_sampler_ms=perf_sample["main_sampler_ms"],
+                    fast_ar_and_sampler_ms=perf_sample["fast_ar_and_sampler_ms"],
+                    total_ms=perf_sample["total_ms"],
+                )
+            )
+
         input_pos += 1
         cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
-        # Roll RAS window left and insert new token at end
-        previous_tokens = previous_tokens.roll(-1, dims=1)
-        previous_tokens[:, -1] = next_token.view(model.config.num_codebooks + 1, -1)[
-            :, 0
-        ]
+        # Reuse the ring buffer instead of allocating a new tensor with roll().
+        previous_tokens[:, i % RAS_WIN_SIZE] = next_token.view(codebook_dim, -1)[:, 0]
         new_tokens.append(next_token)
 
         if cur_token[0, 0, -1] == im_end_id:
             break
 
-    if not new_tokens:  # num_new_tokens <= 0
-        return cur_token.new_empty((model.config.num_codebooks + 1, 0))
-
+    if hasattr(progress, "close"):
+        progress.close()
     del cur_token
 
     return torch.cat(new_tokens, dim=1)
@@ -300,6 +520,23 @@ def generated_codes(
     return y[1:, prompt_length:end].clone()
 
 
+def ensure_model_caches(
+    model: DualARTransformer,
+    *,
+    device: str | torch.device,
+) -> None:
+    if getattr(model, "_cache_setup_done", False):
+        return
+
+    with torch.device(device):
+        model.setup_caches(
+            max_batch_size=1,
+            max_seq_len=model.config.max_seq_len,
+            dtype=next(model.parameters()).dtype,
+        )
+    model._cache_setup_done = True
+
+
 @torch.no_grad()
 @torch.inference_mode()
 def generate(
@@ -311,6 +548,9 @@ def generate(
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
     num_samples: int = 1,
+    metrics: Optional[dict[str, float]] = None,
+    perf_detail: bool = False,
+    perf_sample_frames: int = 16,
     **sampling_kwargs,
 ):
     """
@@ -341,15 +581,7 @@ def generate(
         model.parameters()
     ).dtype  # model weight dtype (bfloat16), NOT prompt dtype (int32)
 
-    # Critical fix: Only set up cache on first run or when necessary
-    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,  # Fixed to 1, avoid dynamic changes
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
-            )
-        model._cache_setup_done = True
+    ensure_model_caches(model, device=device)
 
     codebook_dim = 1 + model.config.num_codebooks
 
@@ -364,9 +596,15 @@ def generate(
     temp_val = sampling_kwargs.get("temperature", DEFAULT_TEMPERATURE)
     top_p_val = sampling_kwargs.get("top_p", DEFAULT_TOP_P)
     top_k_val = sampling_kwargs.get("top_k", DEFAULT_TOP_K)
+    repetition_penalty_val = sampling_kwargs.get(
+        "repetition_penalty", DEFAULT_REPETITION_PENALTY
+    )
 
     temperature = torch.tensor(temp_val, device=device, dtype=dtype)
     top_p = torch.tensor(top_p_val, device=device, dtype=dtype)
+    repetition_penalty = torch.tensor(
+        repetition_penalty_val, device=device, dtype=dtype
+    )
 
     # Build semantic logit bias: 0 for semantic tokens + im_end, -inf for all others
     vocab_size = model.config.vocab_size
@@ -384,6 +622,12 @@ def generate(
 
     prefill_decode = decode_one_token_ar
 
+    semantic_timer = AcceleratorTimer(device)
+    prefill_timer = AcceleratorTimer(device)
+    ar_decode_timer = AcceleratorTimer(device)
+    semantic_timer.start()
+    prefill_timer.start()
+    prefill_perf_sample: dict[str, float] | None = {} if perf_detail else None
     first_token = prefill_decode(
         model,
         prompt.view(1, codebook_dim, -1),
@@ -394,13 +638,18 @@ def generate(
         semantic_logit_bias,
         audio_masks,
         audio_parts,
+        repetition_penalty=repetition_penalty,
         kv_len=T,
+        perf_sample=prefill_perf_sample,
     ).clone()
+    prefill_timer.stop()
     seq[:, T : T + 1] = first_token
 
     # Recreate input_pos
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
+    ar_decode_timer.start()
+    perf_samples: list[PerfDetailSample] = []
     x = decode_n_tokens(
         model,
         first_token.view(1, codebook_dim, -1),
@@ -409,12 +658,76 @@ def generate(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k_val,
+        repetition_penalty=repetition_penalty,
         semantic_logit_bias=semantic_logit_bias,
         audio_masks=audio_masks,
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
         kv_start_pos=T,
+        perf_detail=perf_detail,
+        perf_sample_frames=perf_sample_frames,
+        perf_samples=perf_samples,
     )
+    ar_decode_timer.stop()
+    semantic_timer.stop()
+    # One wait at the end of the whole semantic phase keeps default metrics
+    # accurate without forcing a CPU/GPU handshake between prefill and AR.
+    semantic_timer.synchronize()
+    if metrics is not None:
+        metrics["prefill_wall_ms"] = prefill_timer.wall_elapsed_ms()
+        metrics["ar_decode_wall_ms"] = ar_decode_timer.wall_elapsed_ms()
+        metrics["semantic_wall_ms"] = semantic_timer.wall_elapsed_ms()
+        prefill_accelerator_ms = prefill_timer.accelerator_elapsed_ms()
+        ar_decode_accelerator_ms = ar_decode_timer.accelerator_elapsed_ms()
+        semantic_accelerator_ms = semantic_timer.accelerator_elapsed_ms()
+        if prefill_accelerator_ms is not None:
+            metrics["prefill_accelerator_ms"] = prefill_accelerator_ms
+        if ar_decode_accelerator_ms is not None:
+            metrics["ar_decode_accelerator_ms"] = ar_decode_accelerator_ms
+        if semantic_accelerator_ms is not None:
+            metrics["semantic_accelerator_ms"] = semantic_accelerator_ms
+        if prefill_perf_sample is not None:
+            metrics.update(
+                {
+                    f"perf_prefill_{key}": value
+                    for key, value in prefill_perf_sample.items()
+                }
+            )
+        metrics.update(summarize_perf_detail(perf_samples))
+
+    if perf_detail and perf_samples:
+        detail_summary = summarize_perf_detail(perf_samples)
+        logger.warning(
+            "Perf detail uses synchronized sampled frames and is diagnostic "
+            "only; do not compare this request's RTF with normal inference."
+        )
+        logger.info(
+            "Perf detail sampled frames: {}",
+            ",".join(str(sample.frame_index) for sample in perf_samples),
+        )
+        logger.info(
+            "Perf detail per sampled frame: slow_transformer={:.3f}ms "
+            "({:.1%}), output_projection={:.3f}ms ({:.1%}), "
+            "slow_ar+output={:.3f}ms ({:.1%}), "
+            "main_sampler={:.3f}ms ({:.1%}), "
+            "fast_ar+residual_sampler={:.3f}ms ({:.1%}), "
+            "profiled_total={:.3f}ms, context first/last={:.3f}/{:.3f}ms "
+            "(ratio {:.3f})",
+            detail_summary["perf_slow_transformer_mean_ms"],
+            detail_summary["perf_slow_transformer_share"],
+            detail_summary["perf_output_projection_mean_ms"],
+            detail_summary["perf_output_projection_share"],
+            detail_summary["perf_slow_ar_and_output_mean_ms"],
+            detail_summary["perf_slow_ar_and_output_share"],
+            detail_summary["perf_main_sampler_mean_ms"],
+            detail_summary["perf_main_sampler_share"],
+            detail_summary["perf_fast_ar_and_sampler_mean_ms"],
+            detail_summary["perf_fast_ar_and_sampler_share"],
+            detail_summary["perf_profiled_frame_mean_ms"],
+            detail_summary["perf_first_frames_mean_ms"],
+            detail_summary["perf_last_frames_mean_ms"],
+            detail_summary["perf_context_latency_ratio"],
+        )
     seq = seq[:, : T + 1 + x.size(1)]
     seq[:, T + 1 :] = x
 
@@ -424,7 +737,7 @@ def generate(
     return seq
 
 
-def init_model(checkpoint_path, device, precision, compile=False):
+def init_model(checkpoint_path, device, precision, compile=False, max_seq_len=None):
     if is_fish_omni_checkpoint(checkpoint_path):
         if compile:
             raise ValueError("--compile is not supported for Drama 3 checkpoints")
@@ -439,7 +752,9 @@ def init_model(checkpoint_path, device, precision, compile=False):
         )
         return model, None
 
-    model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
+    model = DualARTransformer.from_pretrained(
+        checkpoint_path, load_weights=True, max_length=max_seq_len
+    )
 
     model = model.to(device=device, dtype=precision)
     logger.info(f"Restored model from checkpoint")
@@ -564,8 +879,9 @@ def decode_to_audio(codes, codec):
 @dataclass
 class GenerateResponse:
     action: Literal["sample", "next"]
-    codes: torch.Tensor | None = None
-    text: str | None = None
+    codes: Optional[torch.Tensor] = None
+    text: Optional[str] = None
+    metrics: Optional[dict[str, float]] = None
 
 
 def split_text_by_speaker(text: str) -> list[str]:
@@ -637,6 +953,68 @@ def group_turns_into_batches(
     return batches
 
 
+def split_text_into_batches(text: str, max_bytes: int) -> list[str]:
+    """Split plain text without breaking UTF-8 characters.
+
+    Prefer sentence, clause, and whitespace boundaries. If no boundary exists
+    before the byte limit, fall back to a character boundary.
+    """
+    if max_bytes <= 0:
+        raise ValueError("chunk_length must be greater than 0")
+
+    remaining = text.strip()
+    if not remaining:
+        return [text]
+
+    boundaries = frozenset(".!?。！？,，;；:：、\n\t ")
+    batches: list[str] = []
+
+    while len(remaining.encode("utf-8")) > max_bytes:
+        current: list[str] = []
+        current_bytes = 0
+        last_boundary = 0
+
+        for char in remaining:
+            char_bytes = len(char.encode("utf-8"))
+            if current and current_bytes + char_bytes > max_bytes:
+                break
+            current.append(char)
+            current_bytes += char_bytes
+            if char in boundaries:
+                last_boundary = len(current)
+
+        cut = last_boundary or len(current)
+        if cut == 0:
+            # max_bytes is smaller than one character; keep forward progress.
+            cut = 1
+
+        chunk = "".join(current[:cut]).strip()
+        if chunk:
+            batches.append(chunk)
+        remaining = ("".join(current[cut:]) + remaining[len(current) :]).strip()
+
+    if remaining:
+        batches.append(remaining)
+
+    return batches
+
+
+def prepare_text_batches(
+    text: str,
+    *,
+    iterative_prompt: bool,
+    chunk_length: int,
+) -> list[str]:
+    if not iterative_prompt:
+        return [text]
+
+    turns = split_text_by_speaker(text)
+    if turns:
+        return group_turns_into_batches(turns, max_speakers=5, max_bytes=chunk_length)
+
+    return split_text_into_batches(text, max_bytes=chunk_length)
+
+
 def generate_long(
     *,
     model,
@@ -647,11 +1025,13 @@ def generate_long(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     top_p: float = DEFAULT_TOP_P,
     top_k: int = DEFAULT_TOP_K,
-    # Accepted for API compatibility and ignored: decoding uses repetition-aware
-    # sampling (RAS) instead.
+    # S2 applies the penalty in addition to repetition-aware sampling (RAS).
+    # Drama 3 keeps upstream's RAS-only behavior.
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     temperature: float = DEFAULT_TEMPERATURE,
     compile: bool = False,
+    perf_detail: bool = False,
+    perf_sample_frames: int = 16,
     iterative_prompt: bool = True,
     chunk_length: int = DEFAULT_CHUNK_LENGTH,
     prompt_text: str | list[str] | None = None,
@@ -659,7 +1039,12 @@ def generate_long(
     single_chunk: bool = False,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
+    assert 0 < repetition_penalty <= 2, "repetition_penalty must be in (0, 2]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
+    if perf_detail and compile:
+        raise ValueError("perf_detail is not supported together with torch.compile")
+    if not 1 <= perf_sample_frames <= 64:
+        raise ValueError("perf_sample_frames must be between 1 and 64")
 
     if isinstance(model, FishOmniModel):
         yield from generate_long_drama3(
@@ -682,14 +1067,13 @@ def generate_long(
         prompt_tokens = [prompt_tokens]
 
     if use_prompt:
-        assert len(prompt_text) == len(
-            prompt_tokens
-        ), "Prompt text and tokens must have the same length"
+        assert len(prompt_text) == len(prompt_tokens), (
+            "Prompt text and tokens must have the same length"
+        )
 
     if prompt_tokens:
         prompt_tokens = [i.cpu() for i in prompt_tokens]
 
-    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
     max_length = model.config.max_seq_len
 
@@ -705,7 +1089,7 @@ def generate_long(
             else:
                 tagged_prompt_text.append(t)
 
-        system_parts = [
+        system_parts: list[BasePart] = [
             TextPart(
                 text="convert the provided text to speech reference to the following:\n\nText:\n",
                 cal_loss=False,
@@ -718,7 +1102,7 @@ def generate_long(
         system_parts.append(VQPart(codes=all_codes, cal_loss=False))
         # torch.save(all_codes, "debug_vq_codes.pt")
     else:
-        system_parts = [
+        system_parts: list[BasePart] = [
             TextPart(text="convert the provided text to speech", cal_loss=False)
         ]
 
@@ -732,32 +1116,31 @@ def generate_long(
         )
     )
 
-    # Split text by speaker and group into batches
-    turns = split_text_by_speaker(text)
-    if turns:
-        batches = group_turns_into_batches(
-            turns, max_speakers=5, max_bytes=chunk_length
-        )
-    else:
-        batches = [text]
-
-    logger.info(f"Split into {len(turns)} turns, grouped into {len(batches)} batches")
+    batches = prepare_text_batches(
+        text,
+        iterative_prompt=iterative_prompt,
+        chunk_length=chunk_length,
+    )
+    logger.info(
+        "Iterative prompt: {}, grouped text into {} batch(es)",
+        iterative_prompt,
+        len(batches),
+    )
 
     for sample_idx in range(num_samples):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        t0 = time.perf_counter()
-
         # Deep copy base conversation for this sample
         conversation = deepcopy(base_conversation)
 
         for batch_idx, batch_text in enumerate(batches):
+            batch_start = time.perf_counter()
+            log_device_memory(f"before batch {batch_idx}", device)
             logger.info(
                 f"--- Sample {sample_idx}, Batch {batch_idx} "
                 f"({len(batch_text.encode('utf-8'))} bytes) ---"
             )
             logger.info(f"Batch text: {batch_text}")
+
+            prompt_build_start = time.perf_counter()
 
             # Add user message
             conversation.append(
@@ -809,7 +1192,9 @@ def generate_long(
 
             encoded = encoded.to(device=device)
             prompt_length = encoded.size(1)
+            prompt_build_seconds = time.perf_counter() - prompt_build_start
 
+            generation_metrics: dict[str, float] = {}
             y = generate(
                 model=model,
                 prompt=encoded,
@@ -820,28 +1205,77 @@ def generate_long(
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                metrics=generation_metrics,
+                perf_detail=perf_detail,
+                perf_sample_frames=perf_sample_frames,
             )
 
             if sample_idx == 0 and batch_idx == 0 and compile:
-                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+                logger.info(
+                    "First compiled batch wall time: {:.2f} seconds",
+                    time.perf_counter() - batch_start,
+                )
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-            t_batch = time.perf_counter() - t0
+            batch_seconds = time.perf_counter() - batch_start
             tokens_generated = y.size(1) - prompt_length
-            tokens_sec = tokens_generated / t_batch if t_batch > 0 else 0
-            logger.info(
-                f"Batch {batch_idx}: Generated {tokens_generated} tokens in "
-                f"{t_batch:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-            )
-            logger.info(
-                f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
-            )
 
             codes = generated_codes(
                 y, prompt_length, tokenizer.get_token_id(IM_END_TOKEN)
             )
+            semantic_frames = codes.size(1)
+            prefill_wall_ms = generation_metrics.get("prefill_wall_ms", 0.0)
+            ar_decode_wall_ms = generation_metrics.get("ar_decode_wall_ms", 0.0)
+            prefill_accelerator_ms = generation_metrics.get("prefill_accelerator_ms")
+            ar_decode_accelerator_ms = generation_metrics.get(
+                "ar_decode_accelerator_ms"
+            )
+            semantic_accelerator_ms = generation_metrics.get("semantic_accelerator_ms")
+            semantic_wall_ms = generation_metrics.get("semantic_wall_ms", 0.0)
+            semantic_seconds = semantic_wall_ms / 1000
+            frames_per_second = (
+                semantic_frames / semantic_seconds if semantic_seconds > 0 else 0.0
+            )
+            frame_ms = (
+                semantic_wall_ms / semantic_frames if semantic_frames > 0 else 0.0
+            )
+            logger.info(
+                "Batch {} metrics: prompt_tokens={}, generated_tokens={}, "
+                "semantic_frames={}, prompt_build_wall={:.3f}ms, "
+                "prefill_first_frame_wall={:.3f}ms, "
+                "ar_decode_wall={:.3f}ms, semantic_wall={:.3f}ms, "
+                "prefill_accelerator={}, ar_decode_accelerator={}, "
+                "semantic_accelerator={}, "
+                "semantic_frame={:.3f}ms, semantic_frames/s={:.2f}, "
+                "batch_wall={:.3f}ms",
+                batch_idx,
+                prompt_length,
+                tokens_generated,
+                semantic_frames,
+                prompt_build_seconds * 1000,
+                prefill_wall_ms,
+                ar_decode_wall_ms,
+                semantic_wall_ms,
+                (
+                    f"{prefill_accelerator_ms:.3f}ms"
+                    if prefill_accelerator_ms is not None
+                    else "n/a"
+                ),
+                (
+                    f"{ar_decode_accelerator_ms:.3f}ms"
+                    if ar_decode_accelerator_ms is not None
+                    else "n/a"
+                ),
+                (
+                    f"{semantic_accelerator_ms:.3f}ms"
+                    if semantic_accelerator_ms is not None
+                    else "n/a"
+                ),
+                frame_ms,
+                frames_per_second,
+                batch_seconds * 1000,
+            )
+            log_device_memory(f"after batch {batch_idx}", device)
             assert (codes >= 0).all(), f"Negative code found: {codes}"
             if codes.size(1) == y.size(1) - prompt_length:
                 logger.warning(
@@ -863,12 +1297,35 @@ def generate_long(
                         add_im_end=True,
                     )
                 )
-                yield GenerateResponse(action="sample", codes=codes, text=batch_text)
+                yield GenerateResponse(
+                    action="sample",
+                    codes=codes,
+                    text=batch_text,
+                    metrics=(
+                        {
+                            "prompt_build_wall_ms": prompt_build_seconds * 1000,
+                            "prefill_wall_ms": prefill_wall_ms,
+                            "ar_decode_wall_ms": ar_decode_wall_ms,
+                            "semantic_wall_ms": semantic_wall_ms,
+                            "semantic_frames": float(semantic_frames),
+                            "batch_wall_ms": batch_seconds * 1000,
+                        }
+                        | {
+                            key: value
+                            for key, value in {
+                                "prefill_accelerator_ms": prefill_accelerator_ms,
+                                "ar_decode_accelerator_ms": ar_decode_accelerator_ms,
+                                "semantic_accelerator_ms": semantic_accelerator_ms,
+                            }.items()
+                            if value is not None
+                        }
+                    ),
+                )
 
             # Cleanup
             del y, encoded
 
-        if torch.cuda.is_available():
+        if torch.device(device).type == "cuda":
             logger.info(
                 f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
             )
@@ -1017,6 +1474,7 @@ class WrappedGenerateResponse:
 class GenerateRequest:
     request: dict
     response_queue: queue.Queue
+    enqueued_at: float = field(default_factory=time.perf_counter)
 
 
 def launch_thread_safe_queue(
@@ -1024,6 +1482,7 @@ def launch_thread_safe_queue(
     device,
     precision,
     compile: bool = False,
+    max_seq_len: int | None = None,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
@@ -1032,16 +1491,15 @@ def launch_thread_safe_queue(
     def worker():
         try:
             model, decode_one_token = init_model(
-                checkpoint_path, device, precision, compile=compile
+                checkpoint_path,
+                device,
+                precision,
+                compile=compile,
+                max_seq_len=max_seq_len,
             )
             # Drama 3 sizes its caches per request (prompt rows + max_new_tokens).
             if not isinstance(model, FishOmniModel):
-                with torch.device(device):
-                    model.setup_caches(
-                        max_batch_size=1,
-                        max_seq_len=model.config.max_seq_len,
-                        dtype=next(model.parameters()).dtype,
-                    )
+                ensure_model_caches(model, device=device)
         except Exception as e:
             # Re-raised by the caller, which would otherwise wait forever.
             init_errors.append(e)
@@ -1056,24 +1514,29 @@ def launch_thread_safe_queue(
 
             kwargs = item.request
             response_queue = item.response_queue
+            queue_wait_ms = (time.perf_counter() - item.enqueued_at) * 1000
+            queue_wait_reported = False
 
             try:
                 for chunk in generate_long(
                     model=model, decode_one_token=decode_one_token, **kwargs
                 ):
+                    if chunk.metrics is not None and not queue_wait_reported:
+                        chunk.metrics["llama_queue_wait_ms"] = queue_wait_ms
+                        queue_wait_reported = True
                     response_queue.put(
                         WrappedGenerateResponse(status="success", response=chunk)
                     )
 
                 # Only clear cache after complete request batch
-                if torch.cuda.is_available():
+                if torch.device(device).type == "cuda":
                     torch.cuda.empty_cache()
 
             except Exception as e:
                 logger.error(traceback.format_exc())
                 response_queue.put(WrappedGenerateResponse(status="error", response=e))
                 # Clear cache on error
-                if torch.cuda.is_available():
+                if torch.device(device).type == "cuda":
                     torch.cuda.empty_cache()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -1118,12 +1581,13 @@ def launch_thread_safe_queue(
 @click.option(
     "--checkpoint-path",
     type=click.Path(path_type=Path, exists=True),
-    default="checkpoints/s2-pro",
+    default=checkpoint_path(),
 )
+@click.option("--max-seq-len", type=int, default=None)
 @click.option(
     "--device",
     type=str,
-    default="cuda",
+    default=default_device(),
     help="Drama 3 accepts a comma-separated list; the last device holds tower + codec.",
 )
 @click.option(
@@ -1159,6 +1623,7 @@ def main(
     top_k: int,
     temperature: float,
     checkpoint_path: Path,
+    max_seq_len: Optional[int],
     device: str,
     codec_path: Path | None,
     compile: bool,
@@ -1188,7 +1653,11 @@ def main(
     logger.info("Loading model ...")
     t0 = time.time()
     model, decode_one_token = init_model(
-        checkpoint_path, device, precision, compile=compile
+        checkpoint_path,
+        device,
+        precision,
+        compile=compile,
+        max_seq_len=max_seq_len,
     )
     if isinstance(model, FishOmniModel):
         # The codec shares the tower's device and runs in the model's dtype.

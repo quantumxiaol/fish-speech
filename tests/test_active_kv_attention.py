@@ -366,6 +366,37 @@ class ActiveKVAutoregressiveDecodeTest(unittest.TestCase):
             self.assertEqual(codes.shape, (2, frames))
             torch.testing.assert_close(codes, y[1:, 2 : 2 + frames])
 
+    def test_diagnostics_preserve_generation_and_report_timings(self) -> None:
+        model = self._model()
+        metrics = {}
+        kwargs = dict(
+            model=model,
+            prompt=self._prompt(),
+            max_new_tokens=3,
+            audio_masks=None,
+            audio_parts=None,
+            temperature=0.8,
+            top_p=0.8,
+            top_k=1,
+            repetition_penalty=1.1,
+        )
+        torch.manual_seed(5)
+        normal = generate(**kwargs)
+        torch.manual_seed(5)
+        profiled = generate(
+            **kwargs, metrics=metrics, perf_detail=True, perf_sample_frames=2
+        )
+        torch.testing.assert_close(profiled, normal, rtol=0, atol=0)
+        self.assertGreater(metrics["perf_detail_sample_count"], 0)
+        for key in (
+            "semantic_wall_ms",
+            "prefill_wall_ms",
+            "ar_decode_wall_ms",
+            "perf_slow_transformer_mean_ms",
+            "perf_output_projection_mean_ms",
+        ):
+            self.assertGreaterEqual(metrics[key], 0.0)
+
     def test_max_new_tokens_one_and_unbounded(self) -> None:
         def run(max_new_tokens: int) -> torch.Tensor:
             with patch(

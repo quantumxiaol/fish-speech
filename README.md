@@ -64,6 +64,112 @@
 >
 > **For vLLM Omni server, please read [vLLM-Omni Fish Speech S2 Pro Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/fishaudio/Fish-Speech-S2-Pro.md) and the [User Guide](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro).**
 
+### FastAPI Server and Client
+
+This fork keeps its local S2-Pro service on top of upstream `5415669` (Drama-3).
+The original eight local commits are preserved at
+`backup/main-before-upstream-2026-10-26` (`3b74d34`). Local `main` tracks
+`upstream/main`; development continues on `feature/local-tts-upstream-2026-10-26`.
+The active KV cache optimization is already included upstream. The removed
+legacy Gradio UI remains available on the backup branch.
+
+The local service retains S2-Pro repetition penalties, iterative prompts,
+CPU reference caching, MPS cleanup, graceful shutdown, and performance diagnostics.
+Drama-3 is available through upstream's `tools/api_server.py` and requires CUDA;
+the command below continues to use your existing S2-Pro weights on MPS.
+The upstream API uses its new sampling defaults when fields are omitted; the
+local FastAPI client retains its explicit generation defaults.
+
+Start the local FastAPI server:
+
+```bash
+fish-tts-server \
+  --host 127.0.0.1 \
+  --port 8002 \
+  --llama-checkpoint-path ./modelsweights/s2-pro \
+  --decoder-checkpoint-path ./modelsweights/s2-pro/codec.pth \
+  --storage-root ./storage/fish_speech_service \
+  --device mps \
+  --dtype float16 \
+  --max-seq-len 4096
+```
+
+The FastAPI server and client default to port `8002`. On macOS, the server reads `.env` before importing PyTorch and defaults to conservative MPS memory settings:
+`PYTORCH_ENABLE_MPS_FALLBACK=1`, `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.55`, and `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.75`.
+
+Synthesize with a reference audio and transcript:
+
+```bash
+fish-tts-client voice-clone \
+  --ref-audio inputs/ref.wav \
+  --ref-text "Reference transcript text" \
+  --text "Text to synthesize" \
+  --repetition-penalty 1.1 \
+  --download-to outputs/out.wav
+```
+
+Long text is split into iterative prompt batches by default, using
+`--chunk-length` as the UTF-8 byte limit. Pass `--no-iterative-prompt` to
+synthesize the request as one batch. The equivalent FastAPI form field is
+`iterative_prompt=true|false`; `/v1/tts` accepts the same field in
+`ServeTTSRequest`.
+
+For repeated requests with the same reference audio, add
+`--use-memory-cache on`. The cache is keyed by the reference audio bytes,
+stores only the encoded VQ tokens on CPU, and lasts until the server exits.
+Single voice-clone requests default to `off`; batch-file requests default to
+`on`.
+
+Inference logs report phase wall timings, CUDA accelerator-event timings,
+semantic frame latency/rate, end-to-end RTF, and MPS or CUDA allocator memory.
+MPS metrics deliberately avoid event elapsed-time reads because they can block
+indefinitely in the threaded worker on PyTorch 2.8; default MPS metrics add no
+frame-level synchronization. Actual Metal timing, bandwidth, and GPU occupancy
+require a Metal trace; start the server with `--mps-profile` to emit PyTorch MPS
+signposts for Instruments:
+
+```bash
+fish-tts-server ... --device mps --mps-profile
+```
+
+To diagnose semantic generation itself, run a separate benchmark server with
+sampled stage timing:
+
+```bash
+fish-tts-server ... --device mps --perf-detail --perf-sample-frames 16
+```
+
+The equivalent project-scoped debug environment switch is:
+
+```bash
+FISH_TTS_DEBUG=true fish-tts-server ... --device mps
+```
+
+Use `FISH_TTS_PERF_SAMPLE_FRAMES=16` to change its sample limit. A bare
+`DEBUG=true` is intentionally ignored so unrelated frameworks or IDE launch
+settings cannot accidentally enable synchronized inference diagnostics.
+
+`--perf-detail` synchronizes only selected semantic frames and reports
+`slow_transformer`, `output_projection`, `slow_ar+output`, `main_sampler`, and
+`fast_ar+residual_sampler`. It is diagnostic-only and changes the sampled
+request's timing, so do not use that request's end-to-end RTF as a production
+benchmark. Run `--mps-profile` separately, without `--perf-detail`, when
+collecting an Instruments trace of GPU activity, occupancy, and bandwidth.
+
+Before starting another memory-intensive local job, gracefully stop the server
+and wait until port `8002` is no longer responding:
+
+```bash
+fish-tts-client shutdown
+```
+
+The shutdown API only accepts loopback clients and requires a confirmation
+header supplied automatically by `fish-tts-client`. Because shutdown exits the
+server process, start `fish-tts-server` again before the next synthesis session.
+The server does not shut down automatically when it is idle.
+
+If the virtual environment is not activated, use `.venv/bin/fish-tts-server` and `.venv/bin/fish-tts-client`.
+
 ### For LLM Agent
 
 ```

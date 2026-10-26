@@ -107,9 +107,14 @@ ffprobe.exe
 # Server Related
 # --------------
 /data_server/target/
+storage/
 
 # Test Files
 # ----------
 /*.test.sh
 asr-label*
+
+modelsweights/
+inputs/
 outputs/
+.env

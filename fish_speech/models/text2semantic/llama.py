@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import math
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from loguru import logger
 from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from fish_speech.device_memory import synchronize_device
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -324,7 +327,12 @@ class BaseTransformer(nn.Module):
         audio_parts: Optional[Tensor] = None,
         return_all: bool = False,
         kv_len: Optional[int] = None,
+        perf_sample: Optional[dict[str, float]] = None,
     ) -> BaseTransformerForwardResult:
+        if perf_sample is not None:
+            # DEBUG-only timing. The caller already synchronized before entering
+            # this method, so this timestamp starts at the embedding stage.
+            slow_transformer_start = time.perf_counter()
 
         # Embedding logic replicated from embed() for compilation compatibility
         embeds = []
@@ -398,12 +406,25 @@ class BaseTransformer(nn.Module):
 
         slow_out = self.norm(x)
 
+        if perf_sample is not None:
+            synchronize_device(inp.device)
+            output_projection_start = time.perf_counter()
+            perf_sample["slow_transformer_ms"] = (
+                output_projection_start - slow_transformer_start
+            ) * 1000
+
         if self.config.is_reward_model:
             token_logits = self.score_output(slow_out)
         elif self.config.tie_word_embeddings:
             token_logits = F.linear(slow_out, self.embeddings.weight)
         else:
             token_logits = self.output(slow_out)
+
+        if perf_sample is not None:
+            synchronize_device(inp.device)
+            perf_sample["output_projection_ms"] = (
+                time.perf_counter() - output_projection_start
+            ) * 1000
 
         hidden_out = (
             slow_out if getattr(self.config, "norm_fastlayer_input", False) else x
@@ -554,8 +575,14 @@ class NaiveTransformer(BaseTransformer):
         x: Tensor,
         input_pos: Optional[Tensor] = None,
         kv_len: Optional[int] = None,
+        perf_sample: Optional[dict[str, float]] = None,
     ) -> TransformerForwardResult:
-        result = super().forward_generate(x, input_pos, kv_len=kv_len)
+        result = super().forward_generate(
+            x,
+            input_pos,
+            kv_len=kv_len,
+            perf_sample=perf_sample,
+        )
         return self.decode(result)
 
 
@@ -650,6 +677,7 @@ class DualARTransformer(BaseTransformer):
         audio_masks: Optional[Tensor] = None,
         audio_parts: Optional[Tensor] = None,
         kv_len: Optional[int] = None,
+        perf_sample: Optional[dict[str, float]] = None,
     ) -> TransformerForwardResult:
         x = super().forward_generate(
             x,
@@ -657,6 +685,7 @@ class DualARTransformer(BaseTransformer):
             audio_masks,
             audio_parts,
             kv_len=kv_len,
+            perf_sample=perf_sample,
         )
         x.hidden_states = self.fast_project_in(x.hidden_states)
         return x

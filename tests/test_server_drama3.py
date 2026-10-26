@@ -89,7 +89,7 @@ class SamplingDefaultsTest(unittest.TestCase):
         )
         self.assertEqual(params["top_k"], 30)
 
-    def test_warns_that_repetition_penalty_is_ignored(self):
+    def test_only_drama3_warns_that_repetition_penalty_is_ignored(self):
         with patch("fish_speech.inference_engine.logger") as log:
             for family in ("drama3", "s2"):
                 make_engine(family).resolve_sampling(
@@ -99,7 +99,7 @@ class SamplingDefaultsTest(unittest.TestCase):
             make_engine("drama3").resolve_sampling(
                 ServeTTSRequest(text="hi", repetition_penalty=1.2)
             )
-        self.assertEqual(log.warning.call_count, 2)
+        self.assertEqual(log.warning.call_count, 1)
 
     def test_request_is_forwarded_with_resolved_sampling(self):
         engine = make_engine("drama3")
@@ -155,7 +155,9 @@ class ReferenceSpeakerTest(unittest.TestCase):
                 )
                 tokens, texts = engine.load_references(req)
         self.assertEqual(encode.call_count, 1)
-        self.assertIs(tokens[0], codes)
+        torch.testing.assert_close(tokens[0], codes)
+        self.assertEqual(tokens[0].device.type, "cpu")
+        self.assertFalse(tokens[0].requires_grad)
         self.assertEqual(texts, ["<|speaker:3|> New."])
 
     def test_speaker_must_be_0_to_15(self):

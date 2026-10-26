@@ -114,14 +114,20 @@ def parse_args():
         help="Chunk length for synthesis (S2-Pro only; Drama 3 uses ~300-byte chunks)",
     )
     parser.add_argument(
+        "--iterative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Split long text into iterative prompt batches",
+    )
+    parser.add_argument(
         "--top_p", type=float, default=None, help="Top-p sampling for synthesis"
     )
     parser.add_argument(
         "--repetition_penalty",
         type=float,
         default=None,
-        help="Accepted for compatibility; S2-Pro and Drama 3 ignore it and use "
-        "repetition-aware sampling",
+        help="Additional repetition penalty for S2-Pro; Drama 3 uses "
+        "repetition-aware sampling and ignores this value",
     )
     parser.add_argument(
         "--temperature", type=float, default=None, help="Temperature for sampling"
@@ -207,6 +213,7 @@ if __name__ == "__main__":
         "max_new_tokens": args.max_new_tokens,
         "chunk_length": args.chunk_length,
         "single_chunk": args.single_chunk,
+        "iterative_prompt": args.iterative_prompt,
         "top_p": args.top_p,
         "repetition_penalty": args.repetition_penalty,
         "temperature": args.temperature,

@@ -1,4 +1,5 @@
 import io
+import os
 from argparse import ArgumentParser
 from http import HTTPStatus
 from typing import Annotated, Any
@@ -18,6 +19,11 @@ from kui.asgi import (
 from loguru import logger
 from pydantic import BaseModel
 
+from fish_speech.env_config import (
+    checkpoint_path,
+    decoder_checkpoint_path,
+    default_device,
+)
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
@@ -29,14 +35,18 @@ def parse_args():
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro",
+        default=str(checkpoint_path()),
         help="S2-Pro (dual_ar) or Drama 3 (fish_omni) checkpoint directory; "
         "the model type is detected from its config.json.",
     )
     parser.add_argument(
         "--decoder-checkpoint-path",
         type=str,
-        default=None,
+        default=(
+            str(decoder_checkpoint_path())
+            if os.getenv("FISH_SPEECH_DECODER_CHECKPOINT_PATH")
+            else None
+        ),
         help="DAC codec weights. Defaults to <checkpoint>/codec.pth, else the "
         "sibling s2-pro/codec.pth.",
     )
@@ -44,7 +54,7 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
+        default=default_device(),
         help="Drama 3 only: plain 'cuda' takes the first min(4, visible) GPUs, or list "
         "them ('cuda:0,cuda:1,...'); the last one holds the tower and the codec.",
     )
