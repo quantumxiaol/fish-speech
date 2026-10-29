@@ -127,6 +127,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         time_to_first_audio_ms = 0.0
         segments = []
         request_had_error = False
+        finish_reason = "stop"
         memory_stats = None
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(device)
@@ -178,6 +179,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 result: GenerateResponse = wrapped_result.response
                 if result.action == "next":
                     break
+                if result.finish_reason == "length":
+                    finish_reason = "length"
 
                 if result.metrics is not None:
                     llama_queue_wait_ms = max(
@@ -290,6 +293,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 code="final",
                 audio=(sample_rate, audio),
                 error=None,
+                finish_reason=finish_reason,
             )
 
         return None

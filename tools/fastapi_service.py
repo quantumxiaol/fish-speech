@@ -8,9 +8,9 @@ import tempfile
 import threading
 import uuid
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Callable, Optional
+from typing import Annotated, Callable, Iterator, Optional
 
 from dotenv import load_dotenv
 
@@ -60,6 +60,7 @@ from fish_speech.device_memory import (  # noqa: E402
     get_mps_memory_snapshot,
 )
 from fish_speech.inference_engine import TTSInferenceEngine  # noqa: E402
+from fish_speech.inference_engine.utils import InferenceResult  # noqa: E402
 from fish_speech.models.dac.inference import load_model as load_decoder_model  # noqa: E402
 from fish_speech.models.text2semantic.inference import (  # noqa: E402
     launch_thread_safe_queue,
@@ -206,6 +207,9 @@ class ServiceSettings:
     mps_profile: bool = False
     perf_detail: bool = False
     perf_sample_frames: int = 16
+    openai_model_id: str = "s2-pro"
+    openai_api_key: Optional[str] = field(default=None, repr=False)
+    voices_dir: Optional[Path] = None
 
     @classmethod
     def from_env(cls) -> "ServiceSettings":
@@ -231,6 +235,13 @@ class ServiceSettings:
                 or _env_flag("FISH_TTS_PERF_DETAIL")
             ),
             perf_sample_frames=_perf_sample_frames_from_env(),
+            openai_model_id=os.getenv("FISH_TTS_MODEL_ID", "s2-pro").strip() or "s2-pro",
+            openai_api_key=os.getenv("FISH_TTS_API_KEY") or None,
+            voices_dir=(
+                Path(os.environ["FISH_TTS_VOICES_DIR"]).expanduser().resolve()
+                if os.getenv("FISH_TTS_VOICES_DIR")
+                else None
+            ),
         )
 
 
@@ -416,6 +427,23 @@ class ModelManager:
             return self._engine
 
     def infer(self, request: ServeTTSRequest) -> tuple[int, np.ndarray]:
+        result = self.infer_result(request)
+        sample_rate, audio = result.audio
+        return int(sample_rate), audio
+
+    def infer_result(self, request: ServeTTSRequest) -> InferenceResult:
+        final = None
+        for result in self.iter_inference(request):
+            if result.code == "error":
+                raise result.error or RuntimeError("Speech generation failed.")
+            if result.code == "final" and isinstance(result.audio, tuple):
+                final = result
+        if final is None:
+            raise RuntimeError("No audio generated, please check the input text.")
+        return final
+
+    def iter_inference(self, request: ServeTTSRequest) -> Iterator[InferenceResult]:
+        """Serialize all APIs through one model; callers must drain the iterator."""
         engine = self.get_engine()
         profile_context = nullcontext()
         if self.settings.mps_profile and self.device == "mps":
@@ -430,13 +458,7 @@ class ModelManager:
 
         with self._inference_lock:
             with profile_context:
-                for result in engine.inference(request):
-                    if result.code == "error":
-                        raise RuntimeError(str(result.error))
-                    if result.code == "final" and isinstance(result.audio, tuple):
-                        sample_rate, audio = result.audio
-                        return int(sample_rate), audio
-        raise RuntimeError("No audio generated, please check the input text.")
+                yield from engine.inference(request)
 
 
 class ServerShutdownController:
@@ -916,6 +938,9 @@ def create_app(
             format=audio_format,
         )
 
+    from tools.openai_tts_api import create_router
+
+    app.include_router(create_router(manager, app_settings, shutdown_controller))
     return app
 
 
@@ -927,6 +952,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--storage-root", default=None)
+    parser.add_argument(
+        "--voices-dir", default=None,
+        help="Local voice directories (WAV/MP3 plus .lab transcript).",
+    )
+    parser.add_argument(
+        "--model-id", default=None,
+        help="Model name advertised by /v1/models (default: s2-pro).",
+    )
     parser.add_argument("--llama-checkpoint-path", default=None)
     parser.add_argument("--decoder-checkpoint-path", default=None)
     parser.add_argument("--decoder-config-name", default=None)

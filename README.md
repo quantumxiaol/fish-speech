@@ -170,6 +170,29 @@ The server does not shut down automatically when it is idle.
 
 If the virtual environment is not activated, use `.venv/bin/fish-tts-server` and `.venv/bin/fish-tts-client`.
 
+### OpenAI-compatible and MiMo-style TTS APIs
+
+The same `fish-tts-server` also serves `POST /v1/audio/speech` (binary audio),
+`POST /v1/chat/completions` (MiMo-style audio JSON or PCM SSE), and
+`GET /v1/models`. All routes share the existing model, inference lock, and
+graceful shutdown controller.
+
+```bash
+curl http://127.0.0.1:8002/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"s2-pro","input":"你好，欢迎使用语音服务。","voice":"default","response_format":"wav"}' \
+  --output speech.wav
+```
+
+`default` generates without a voice reference. For a reproducible reference
+voice, put one WAV/MP3 and its matching `.lab` transcript in
+`storage/fish_speech_service/voices/<voice-id>/`, then use that ID as `voice`.
+Set `FISH_TTS_API_KEY` to optionally require Bearer or `api-key` authentication
+on `/v1/*`.
+
+See [中文接口说明与 OpenAI SDK / SSE 示例](docs/zh/openai_api.md) for voice cloning,
+supported fields, audio formats, and the differences from OpenAI and MiMo.
+
 ### For LLM Agent
 
 ```

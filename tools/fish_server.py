@@ -16,6 +16,12 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = ServiceSettings.from_env()
+    if args.voices_dir:
+        settings = replace(
+            settings, voices_dir=Path(args.voices_dir).expanduser().resolve()
+        )
+    if args.model_id:
+        settings = replace(settings, openai_model_id=args.model_id)
     if args.storage_root:
         settings = replace(
             settings, storage_root=Path(args.storage_root).expanduser().resolve()

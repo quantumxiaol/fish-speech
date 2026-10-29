@@ -882,6 +882,7 @@ class GenerateResponse:
     codes: Optional[torch.Tensor] = None
     text: Optional[str] = None
     metrics: Optional[dict[str, float]] = None
+    finish_reason: Literal["stop", "length"] | None = None
 
 
 def split_text_by_speaker(text: str) -> list[str]:
@@ -1301,6 +1302,9 @@ def generate_long(
                     action="sample",
                     codes=codes,
                     text=batch_text,
+                    finish_reason=(
+                        "length" if codes.size(1) == tokens_generated else "stop"
+                    ),
                     metrics=(
                         {
                             "prompt_build_wall_ms": prompt_build_seconds * 1000,
@@ -1433,7 +1437,12 @@ def generate_long_drama3(
                 )
             if len(frames):
                 codes = frames[:, 1:].T.contiguous()
-                yield GenerateResponse(action="sample", codes=codes, text=chunk)
+                yield GenerateResponse(
+                    action="sample",
+                    codes=codes,
+                    text=chunk,
+                    finish_reason="stop" if finish_reason == "eos" else "length",
+                )
                 history.push(chunk, codes.cpu())
             else:
                 logger.warning("The model emitted EOS before any audio frame")
