@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from fish_speech.device_memory import synchronize_device
+from fish_speech.models.text2semantic.mps_compile import mps_sdpa
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -783,7 +784,21 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
         if self.use_sdpa:
-            if mask is None:
+            if (
+                q.device.type == "mps"
+                and not self.training
+                and not torch.is_grad_enabled()
+                and torch.compiler.is_compiling()
+            ):
+                y = mps_sdpa(
+                    q,
+                    k,
+                    v,
+                    mask,
+                    self.dropout if self.training else 0.0,
+                    mask is None,
+                )
+            elif mask is None:
                 with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                     y = F.scaled_dot_product_attention(
                         q,

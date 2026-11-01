@@ -46,8 +46,10 @@ def main() -> None:
         settings = replace(settings, max_seq_len=args.max_seq_len)
     if args.dtype:
         settings = replace(settings, dtype=args.dtype)
-    if args.compile:
-        settings = replace(settings, compile=True)
+    if args.compile is not None:
+        settings = replace(settings, compile=args.compile)
+    if args.compile_backend:
+        settings = replace(settings, compile_backend=args.compile_backend)
     if args.mps_profile:
         settings = replace(settings, mps_profile=True)
     if args.perf_detail:

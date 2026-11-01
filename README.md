@@ -94,8 +94,58 @@ fish-tts-server \
   --max-seq-len 4096
 ```
 
+
+```bash
+fish-tts-server \
+  --host 127.0.0.1 \
+  --port 8002 \
+  --llama-checkpoint-path ./modelsweights/s2-pro \
+  --decoder-checkpoint-path ./modelsweights/s2-pro/codec.pth \
+  --storage-root ./storage/fish_speech_service \
+  --device mps \
+  --dtype float16 \
+  --max-seq-len 4096 \
+  --compile \
+  --compile-backend inductor
+```
+
 The FastAPI server and client default to port `8002`. On macOS, the server reads `.env` before importing PyTorch and defaults to conservative MPS memory settings:
 `PYTORCH_ENABLE_MPS_FALLBACK=1`, `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.55`, and `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.75`.
+
+For S2-Pro on Apple MPS, append **both** `--compile --compile-backend inductor`
+to the command above to compile autoregressive decode. This keeps the growing
+active KV prefix (`dynamic=True`) and uses native MPS attention and repetition
+window detection through small compiler wrappers; neither operation moves to CPU.
+The codec remains eager. Compilation is optional and disabled by default.
+
+On an M4 Pro with 48 GiB unified memory, PyTorch 2.8.0, FP16 and a 4096-token
+cache, a Japanese voice-cloning benchmark produced these results (three warm
+requests averaged, identical text/reference/seed/sampling parameters, capped at
+96 semantic frames / 4.46 seconds of audio):
+
+| Decode mode | Semantic frames/s | Request wall time |
+| --- | ---: | ---: |
+| Eager | 7.20 | 13.97 s |
+| `--compile --compile-backend aot_eager` | 4.90 | 20.35 s |
+| `--compile --compile-backend inductor` | 11.27 | 9.52 s |
+
+Inductor improved semantic throughput by about 57% and reduced request time by
+about 32% in this workload. Post-request MPS driver allocation was about 14.33 GiB
+for both eager and Inductor; this is not peak memory. The first Inductor synthesis
+took 51 seconds, excluding 56 seconds to load the models. Allow a longer client
+timeout for the first request. New shapes/settings can trigger additional
+compilation, so compare warmed requests. A fixed seed does not guarantee identical
+audio between eager and compiled execution.
+
+`--compile` alone preserves the previous backend selection: `inductor` on CUDA,
+`aot_eager` on MPS/CPU. Select `inductor` explicitly for the measured MPS speedup;
+`aot_eager` does not provide the same kernel fusion. Equivalent `.env` settings
+are `FISH_TTS_COMPILE=true` and `FISH_TTS_COMPILE_BACKEND=inductor`.
+Use `--no-compile` to override the environment and return to eager execution.
+`GET /fishspeech/health` reports the configured `compile` and `compile_backend`;
+actual compilation is lazy and happens during the first decode.
+Do not combine compilation with `--perf-detail`, `FISH_TTS_PERF_DETAIL=true`, or
+`FISH_TTS_DEBUG=true`. Drama-3 compilation is not supported by this service.
 
 Synthesize with a reference audio and transcript:
 

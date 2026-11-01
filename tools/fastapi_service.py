@@ -64,6 +64,7 @@ from fish_speech.inference_engine.utils import InferenceResult  # noqa: E402
 from fish_speech.models.dac.inference import load_model as load_decoder_model  # noqa: E402
 from fish_speech.models.text2semantic.inference import (  # noqa: E402
     launch_thread_safe_queue,
+    resolve_compile_backend,
 )
 from fish_speech.utils.file import audio_to_bytes  # noqa: E402
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest  # noqa: E402
@@ -210,6 +211,7 @@ class ServiceSettings:
     openai_model_id: str = "s2-pro"
     openai_api_key: Optional[str] = field(default=None, repr=False)
     voices_dir: Optional[Path] = None
+    compile_backend: str = "auto"
 
     @classmethod
     def from_env(cls) -> "ServiceSettings":
@@ -228,6 +230,9 @@ class ServiceSettings:
             device=default_device(fallback="") or None,
             dtype=os.getenv("FISH_TTS_DTYPE") or None,
             compile=_env_flag("FISH_TTS_COMPILE"),
+            compile_backend=os.getenv("FISH_TTS_COMPILE_BACKEND", "auto")
+            .strip()
+            .lower(),
             max_seq_len=_optional_int(os.getenv("FISH_TTS_MAX_SEQ_LEN", "4096")),
             mps_profile=_env_flag("FISH_TTS_MPS_PROFILE"),
             perf_detail=(
@@ -279,6 +284,8 @@ class HealthResponse(BaseModel):
     loaded: bool
     device: str
     dtype: str
+    compile: bool
+    compile_backend: Optional[str]
     max_seq_len: Optional[int]
     llama_checkpoint_path: str
     decoder_checkpoint_path: str
@@ -373,6 +380,13 @@ class ModelManager:
         self.settings = settings
         self.device = _choose_device(settings.device)
         self.dtype = _resolve_torch_dtype(settings.dtype, self.device)
+        self.compile_backend = resolve_compile_backend(
+            self.device, settings.compile_backend
+        )
+        if settings.compile and settings.perf_detail:
+            raise ValueError(
+                "--compile cannot be combined with --perf-detail / FISH_TTS_DEBUG"
+            )
         self._engine: Optional[TTSInferenceEngine] = None
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
@@ -397,12 +411,15 @@ class ModelManager:
                 return self._engine
 
             logger.info(
-                "Loading Fish Speech models: llama={} decoder={} device={} dtype={} max_seq_len={}",
+                "Loading Fish Speech models: llama={} decoder={} device={} dtype={} "
+                "max_seq_len={} compile={} compile_backend={}",
                 self.settings.llama_checkpoint_path,
                 self.settings.decoder_checkpoint_path,
                 self.device,
                 self.dtype,
                 self.settings.max_seq_len,
+                self.settings.compile,
+                self.compile_backend if self.settings.compile else "disabled",
             )
             llama_queue = launch_thread_safe_queue(
                 checkpoint_path=self.settings.llama_checkpoint_path,
@@ -410,6 +427,7 @@ class ModelManager:
                 precision=self.dtype,
                 compile=self.settings.compile,
                 max_seq_len=self.settings.max_seq_len,
+                compile_backend=self.settings.compile_backend,
             )
             decoder_model = load_decoder_model(
                 config_name=self.settings.decoder_config_name,
@@ -702,6 +720,12 @@ def create_app(
             loaded=manager.loaded,
             device=manager.device,
             dtype=str(manager.dtype).replace("torch.", ""),
+            compile=app_settings.compile,
+            compile_backend=(
+                resolve_compile_backend(manager.device, app_settings.compile_backend)
+                if app_settings.compile
+                else None
+            ),
             max_seq_len=app_settings.max_seq_len,
             llama_checkpoint_path=str(app_settings.llama_checkpoint_path),
             decoder_checkpoint_path=str(app_settings.decoder_checkpoint_path),
@@ -970,7 +994,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
     )
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compile S2-Pro decode; --no-compile overrides FISH_TTS_COMPILE.",
+    )
+    parser.add_argument(
+        "--compile-backend",
+        choices=["auto", "inductor", "aot_eager"],
+        default=None,
+        help="Backend used with --compile (auto: CUDA=inductor, MPS/CPU=aot_eager).",
+    )
     parser.add_argument(
         "--mps-profile",
         action="store_true",

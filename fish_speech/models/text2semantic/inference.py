@@ -73,11 +73,8 @@ if hasattr(torch._inductor.config, "fx_graph_cache"):
 
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from fish_speech.models.text2semantic.llama import (
-    BaseTransformer,
-    DualARTransformer,
-    NaiveTransformer,
-)
+from fish_speech.models.text2semantic.llama import DualARTransformer
+from fish_speech.models.text2semantic.mps_compile import mps_in_window
 
 
 def multinomial_sample_one_no_sync(probs_sort):
@@ -326,7 +323,10 @@ def decode_one_token_ar(
 
     # Use high-temp sample if: token is semantic AND token is in previous window
     if previous_tokens is not None:
-        in_window = (previous_tokens[0] == main_token_normal).any()
+        if x.device.type == "mps" and torch.compiler.is_compiling():
+            in_window = mps_in_window(previous_tokens[0], main_token_normal)
+        else:
+            in_window = (previous_tokens[0] == main_token_normal).any()
         # Use tensor ops (&, torch.where) instead of Python (and, if) — torch.compile requires no data-dependent branching
         is_semantic = (main_token_normal >= model.config.semantic_begin_id) & (
             main_token_normal <= model.config.semantic_end_id
@@ -737,7 +737,22 @@ def generate(
     return seq
 
 
-def init_model(checkpoint_path, device, precision, compile=False, max_seq_len=None):
+def resolve_compile_backend(device: str | torch.device, backend: str = "auto") -> str:
+    if backend not in {"auto", "inductor", "aot_eager"}:
+        raise ValueError("compile backend must be auto, inductor, or aot_eager")
+    if backend == "auto":
+        return "inductor" if torch.device(device).type == "cuda" else "aot_eager"
+    return backend
+
+
+def init_model(
+    checkpoint_path,
+    device,
+    precision,
+    compile=False,
+    max_seq_len=None,
+    compile_backend: str = "auto",
+):
     if is_fish_omni_checkpoint(checkpoint_path):
         if compile:
             raise ValueError("--compile is not supported for Drama 3 checkpoints")
@@ -770,11 +785,17 @@ def init_model(checkpoint_path, device, precision, compile=False, max_seq_len=No
     model._cache_setup_done = False
 
     if compile:
-        logger.info("Compiling function...")
+        backend = resolve_compile_backend(device, compile_backend)
+        logger.info(
+            "Compiling S2-Pro decode: device={}, backend={}, dynamic=True; "
+            "the first decode performs compilation",
+            device,
+            backend,
+        )
         decode_one_token = torch.compile(
             decode_one_token,
-            backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="default" if torch.cuda.is_available() else None,
+            backend=backend,
+            mode="default" if backend == "inductor" else None,
             fullgraph=True,
             dynamic=True,
         )
@@ -1492,6 +1513,7 @@ def launch_thread_safe_queue(
     precision,
     compile: bool = False,
     max_seq_len: int | None = None,
+    compile_backend: str = "auto",
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
@@ -1505,6 +1527,7 @@ def launch_thread_safe_queue(
                 precision,
                 compile=compile,
                 max_seq_len=max_seq_len,
+                compile_backend=compile_backend,
             )
             # Drama 3 sizes its caches per request (prompt rows + max_new_tokens).
             if not isinstance(model, FishOmniModel):

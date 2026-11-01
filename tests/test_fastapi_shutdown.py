@@ -145,7 +145,11 @@ class FastAPIShutdownEndpointTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = self._make_app(Path(tmp), [])
-            with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            with (
+                patch("tools.fastapi_service.get_mps_memory_snapshot", return_value=None),
+                patch("tools.fastapi_service.get_cuda_memory_snapshot", return_value=None),
+                TestClient(app, client=("127.0.0.1", 50000)) as client,
+            ):
                 response = client.get("/fishspeech/health")
 
         self.assertEqual(response.status_code, 200)
