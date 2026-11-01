@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import httpx
+
+from fish_speech.env_config import load_project_env
 
 API_PREFIX = "/fishspeech"
 ADMIN_SHUTDOWN_HEADER = "X-Fish-Speech-Admin"
@@ -29,12 +32,35 @@ class FishSpeechHttpxClient:
         server_url: str = DEFAULT_SERVER_URL,
         timeout: float = 600.0,
         client: Optional[httpx.Client] = None,
+        *,
+        api_key: Optional[str] = None,
     ) -> None:
         normalized_server_url = server_url.rstrip("/")
         if normalized_server_url.endswith(API_PREFIX):
             normalized_server_url = normalized_server_url[: -len(API_PREFIX)]
         self.server_url = normalized_server_url
         self._client = client or httpx.Client(base_url=self.server_url, timeout=timeout)
+        if api_key is None:
+            load_project_env()
+            api_key = os.getenv("FISH_TTS_API_KEY")
+        self._api_key = api_key or None
+        self._service_url = (
+            self._client.base_url
+            if self._client.base_url.is_absolute_url
+            else httpx.URL(self.server_url)
+        )
+
+    def _auth_headers(self, url: str = "") -> dict[str, str]:
+        # Download URLs may be absolute. Never forward our key to another origin.
+        target = self._service_url.join(url)
+        same_origin = (target.scheme, target.host, target.port) == (
+            self._service_url.scheme,
+            self._service_url.host,
+            self._service_url.port,
+        )
+        if self._api_key and same_origin:
+            return {"Authorization": f"Bearer {self._api_key}"}
+        return {}
 
     def close(self) -> None:
         self._client.close()
@@ -61,7 +87,9 @@ class FishSpeechHttpxClient:
         return response.json()
 
     def health(self) -> dict[str, Any]:
-        return self._json(self._client.get(f"{API_PREFIX}/health"))
+        return self._json(
+            self._client.get(f"{API_PREFIX}/health", headers=self._auth_headers())
+        )
 
     def shutdown(
         self,
@@ -73,6 +101,7 @@ class FishSpeechHttpxClient:
             self._client.post(
                 f"{API_PREFIX}/admin/shutdown",
                 headers={
+                    **self._auth_headers(),
                     ADMIN_SHUTDOWN_HEADER: ADMIN_SHUTDOWN_VALUE,
                     "Connection": "close",
                 },
@@ -93,9 +122,11 @@ class FishSpeechHttpxClient:
             try:
                 response = self._client.get(
                     f"{API_PREFIX}/health",
-                    headers={"Connection": "close"},
+                    headers={**self._auth_headers(), "Connection": "close"},
                     timeout=max(min(remaining, 1.0), 0.05),
                 )
+                if response.status_code in (401, 403):
+                    self._json(response)
                 if response.status_code != 200:
                     return
                 try:
@@ -116,7 +147,9 @@ class FishSpeechHttpxClient:
     def download_url(self, url: str, output_path: str | Path) -> Path:
         target = Path(output_path).expanduser().resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
-        with self._client.stream("GET", url) as response:
+        with self._client.stream(
+            "GET", url, headers=self._auth_headers(url)
+        ) as response:
             response.raise_for_status()
             with target.open("wb") as handle:
                 for chunk in response.iter_bytes():
@@ -174,7 +207,10 @@ class FishSpeechHttpxClient:
                 )
 
             response = self._client.post(
-                f"{API_PREFIX}/tts/voice_clone", data=data, files=files
+                f"{API_PREFIX}/tts/voice_clone",
+                data=data,
+                files=files,
+                headers=self._auth_headers(),
             )
 
         payload = self._json(response)
@@ -238,7 +274,10 @@ class FishSpeechHttpxClient:
                 )
 
             response = self._client.post(
-                f"{API_PREFIX}/tts/voice_clone_batch_file", data=data, files=files
+                f"{API_PREFIX}/tts/voice_clone_batch_file",
+                data=data,
+                files=files,
+                headers=self._auth_headers(),
             )
 
         payload = self._json(response)

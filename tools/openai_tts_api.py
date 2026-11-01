@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hmac
 import io
 import json
 import queue
@@ -32,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
 from fish_speech.models.text2semantic.errors import InvalidInputError
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+from tools.api_auth import api_key_matches
 
 AudioFormat = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 Text = Annotated[StrictStr, Field(min_length=1, max_length=4096)]
@@ -492,16 +492,7 @@ def create_router(manager, settings, controller):
     }
 
     def authenticate(request: Request):
-        if not settings.openai_api_key:
-            return
-        scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        candidates = [request.headers.get("api-key", "")]
-        if scheme.lower() == "bearer":
-            candidates.append(token.strip())
-        if not any(
-            hmac.compare_digest(value.encode(), settings.openai_api_key.encode())
-            for value in candidates
-        ):
+        if not api_key_matches(request.headers, settings.openai_api_key):
             raise APIError(
                 "Invalid or missing API key.", status=401, code="invalid_api_key"
             )

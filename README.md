@@ -147,6 +147,35 @@ actual compilation is lazy and happens during the first decode.
 Do not combine compilation with `--perf-detail`, `FISH_TTS_PERF_DETAIL=true`, or
 `FISH_TTS_DEBUG=true`. Drama-3 compilation is not supported by this service.
 
+API-key authentication is disabled when `FISH_TTS_API_KEY` is unset or empty.
+To enable it on a remote server, set this in that server's `.env` and restart;
+the server launch command stays the same:
+
+```dotenv
+FISH_TTS_API_KEY=replace-with-a-long-random-secret
+```
+
+Both `/fishspeech/*` and `/v1/*` then require either
+`Authorization: Bearer <key>` or `api-key: <key>`. This includes health checks,
+reference/output downloads, synthesis and shutdown, even on loopback connections
+arriving through an SSH tunnel. Shutdown still requires a loopback connection and
+its confirmation header. `/docs` and `/openapi.json` remain accessible.
+
+`fish-tts-client` and `FishSpeechHttpxClient` read `FISH_TTS_API_KEY` from their
+environment or project `.env`, including for automatic audio downloads. Override
+it with `fish-tts-client --api-key <key> health` or
+`FishSpeechHttpxClient(api_key="...")`. Prefer environment configuration to avoid
+putting a secret in shell history. The Python client sends its key only to the
+configured service origin. For a manual authenticated health check:
+
+```bash
+curl http://127.0.0.1:8002/fishspeech/health \
+  -H "Authorization: Bearer $FISH_TTS_API_KEY"
+```
+
+The shell variable in this curl example must be exported separately; curl does
+not read `.env`. Use an encrypted SSH/frp tunnel or HTTPS for remote connections.
+
 Synthesize with a reference audio and transcript:
 
 ```bash
@@ -238,7 +267,7 @@ curl http://127.0.0.1:8002/v1/audio/speech \
 voice, put one WAV/MP3 and its matching `.lab` transcript in
 `storage/fish_speech_service/voices/<voice-id>/`, then use that ID as `voice`.
 Set `FISH_TTS_API_KEY` to optionally require Bearer or `api-key` authentication
-on `/v1/*`.
+on both `/v1/*` and `/fishspeech/*`.
 
 See [中文接口说明与 OpenAI SDK / SSE 示例](docs/zh/openai_api.md) for voice cloning,
 supported fields, audio formats, and the differences from OpenAI and MiMo.

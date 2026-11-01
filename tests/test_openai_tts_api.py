@@ -240,19 +240,22 @@ class OpenAITTSTest(unittest.TestCase):
         self.assertEqual(self.speech(voice="my_voice").status_code, 400)
         self.assertEqual(self.manager.requests, [])
 
-    def test_bearer_and_api_key_auth_only_apply_to_new_routes(self):
+    def test_bearer_and_api_key_auth_apply_to_both_route_groups(self):
         app = create_app(
             replace(settings(self.root), openai_api_key="test-key"), self.manager
         )
         with TestClient(app) as client:
             self.assertEqual(client.get("/v1/models").status_code, 401)
-            self.assertEqual(client.get("/fishspeech/health").status_code, 200)
+            self.assertEqual(client.get("/fishspeech/health").status_code, 401)
             for headers in (
                 {"Authorization": "Bearer test-key"},
                 {"api-key": "test-key"},
             ):
                 self.assertEqual(
                     client.get("/v1/models", headers=headers).status_code, 200
+                )
+                self.assertEqual(
+                    client.get("/fishspeech/health", headers=headers).status_code, 200
                 )
             response = client.post(
                 "/v1/chat/completions",

@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVER_URL,
         help=f"Server origin without API prefix (default: {DEFAULT_SERVER_URL}).",
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Service API key (defaults to FISH_TTS_API_KEY from environment/.env).",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("health", help="Query service health.")
@@ -131,7 +136,9 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        with FishSpeechHttpxClient(server_url=args.server_url) as client:
+        with FishSpeechHttpxClient(
+            server_url=args.server_url, api_key=args.api_key
+        ) as client:
             if args.command == "health":
                 _print_payload(client.health())
                 return

@@ -20,14 +20,22 @@ Chat 接口采用 MiMo TTS 的“assistant 消息指定朗读文本”约定。�
 这仅修改客户端使用的名称；实际权重仍由 `--llama-checkpoint-path` 决定。
 未知模型 ID 返回 HTTP 400，不会转发到 OpenAI 或 MiMo 云端。
 
-默认不要求密钥。设置 `FISH_TTS_API_KEY` 后，所有 `/v1/*` 请求需要以下任意一个请求头：
+默认不要求密钥。在服务端 `.env` 设置 `FISH_TTS_API_KEY` 并重启后，所有 `/v1/*`
+和 `/fishspeech/*` 请求需要以下任意一个请求头：
 
 ```text
 Authorization: Bearer <你的本地服务密钥>
 api-key: <你的本地服务密钥>
 ```
 
-该设置只作用于新增的 `/v1/*`，原有 `/fishspeech/...` 鉴权规则保持不变。
+未设置或设为空字符串时关闭鉴权，本机启动命令不需要改动。配置密钥后，健康检查、
+音频/参考文件下载、合成和关闭接口都要求密钥；通过 SSH 转发到 loopback 的请求也不例外。
+关闭服务仍需要 loopback 来源和原有确认请求头。`/docs` 和 `/openapi.json` 不要求密钥。
+
+`fish-tts-client` 自动读取客户端环境或项目 `.env` 中的 `FISH_TTS_API_KEY`，
+合成后的自动下载也会携带鉴权。可以用 `fish-tts-client --api-key <密钥> health`
+覆盖环境值，Python 客户端可传 `FishSpeechHttpxClient(api_key="...")`。
+密钥建议放环境配置；远程访问使用加密隧道或 HTTPS。
 OpenAI SDK 要求配置 `api_key`；未启用服务鉴权时，可填 `local`。
 
 `voice="default"` 表示不使用参考音频，不代表某个固定说话人。要使用参考音色，

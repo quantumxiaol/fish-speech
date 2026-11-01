@@ -68,6 +68,7 @@ from fish_speech.models.text2semantic.inference import (  # noqa: E402
 )
 from fish_speech.utils.file import audio_to_bytes  # noqa: E402
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest  # noqa: E402
+from tools.api_auth import FishSpeechAPIKeyMiddleware  # noqa: E402
 
 API_PREFIX = "/fishspeech"
 ADMIN_SHUTDOWN_HEADER = "X-Fish-Speech-Admin"
@@ -209,6 +210,7 @@ class ServiceSettings:
     perf_detail: bool = False
     perf_sample_frames: int = 16
     openai_model_id: str = "s2-pro"
+    # Shared by /fishspeech and /v1; retain the field name for caller compatibility.
     openai_api_key: Optional[str] = field(default=None, repr=False)
     voices_dir: Optional[Path] = None
     compile_backend: str = "auto"
@@ -693,6 +695,7 @@ def create_app(
     )
 
     app = FastAPI(title="Fish Speech FastAPI Service")
+    app.add_middleware(FishSpeechAPIKeyMiddleware, api_key=app_settings.openai_api_key)
     app.state.settings = app_settings
     app.state.model_manager = manager
     app.state.file_store = store
